@@ -1,0 +1,1247 @@
+/*
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  WiFiGuard — Phase 5                                                         ║
+║  Risk scoring v2 + explainability + channel congestion + NEW marker         ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  Changes from Phase 4:                                                       ║
+║                                                                              ║
+║  [P5-1] RiskFactor struct { char label[24]; int8_t delta; }                  ║
+║         Up to 5 factors per network stored in riskCache[].                   ║
+║         computeRisk() fills both the score and the factors array.            ║
+║                                                                              ║
+║  [P5-2] RiskCache array  riskCache[25]                                       ║
+║         Populated after every scan, before showList().                       ║
+║         Invalidated (score = -1) when portalRes changes so ANALYZE           ║
+║         recomputes on next open.                                              ║
+║                                                                              ║
+║  [P5-3] Channel congestion                                                   ║
+║         channelCounts[14] computed once over all nets after scan.            ║
+║         Overlapping channel detection: channels 1–13 consider ±4 neighbours ║
+║         for interference (simplified model).                                 ║
+║         Adds 0–10 pts to risk score with label "Channel congested".          ║
+║         channelCounts[] must be built BEFORE computeRisk() is called.       ║
+║                                                                              ║
+║  [P5-4] Score calibration                                                    ║
+║         OPEN base = 60; WEP = 45; WPA = 22; WPA2 = 8; WPA3 = 3; else = 12  ║
+║         Portal penalty: +15 (portal likely), +8 (no internet),              ║
+║           +5 (connect fail), −5 (no portal)                                  ║
+║         SSID keyword bonus: free+10, guest+5, airport+5, hotel+5,           ║
+║           public+5, cafe+3, starbucks+5                                      ║
+║         Signal penalty: <−85 = +12, <−75 = +8, <−65 = +4                   ║
+║         Channel congestion: +2 per overlapping AP (max +10)                 ║
+║         Hard cap: max 100.  OPEN alone never exceeds 75 (portal pushes to   ║
+║         90). WPA3 with no portal floors at 3.                               ║
+║                                                                              ║
+║  [P5-5] ANALYZE screen "Why?" section                                        ║
+║         Shows top 3 RiskFactors as bullet rows below the data rows.         ║
+║         Format: "• label  +N" (delta in colour matching sign).              ║
+║         Only drawn if factorCount > 0.                                       ║
+║         Uses cached riskCache[sel] — no recompute on every draw.            ║
+║                                                                              ║
+║  [P5-6] "NEW" marker                                                         ║
+║         prevBSSIDs[25] stores packed uint64_t of each BSSID from the        ║
+║         previous scan (zeroed on first run).                                 ║
+║         isNew[25] bool array set after each scan by comparing BSSIDs.       ║
+║         LIST panel: draws "NEW" tag in magenta on the right of the row       ║
+║         when isNew[idx] is true (replaces sec tag for that row).             ║
+║         isNew cleared on each full scan.                                     ║
+║                                                                              ║
+║  [P5-7] riskScore() / riskScoreWithPortal() now delegate to cache.          ║
+║         Old inline functions removed; computeRisk() is the single source.   ║
+║                                                                              ║
+║  All Phase 1–4 features preserved without regression.                       ║
+║  Pins: BAT_ADC=34, TFT_BL=4, BTN_NEXT(L)=0, BTN_ACT(R)=35                 ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+*/
+
+#include <TFT_eSPI.h>
+#include <WiFi.h>
+#include "esp_sleep.h"
+#include <HTTPClient.h>
+#include <WiFiClient.h>
+#include <Preferences.h>
+
+// ═══════════════════════════════════════════════════════════
+// Layout constants
+// ═══════════════════════════════════════════════════════════
+#define HEADER_H  28
+#define FOOTER_H  16
+#define CONTENT_Y HEADER_H
+
+// ═══════════════════════════════════════════════════════════
+// Hardware
+// ═══════════════════════════════════════════════════════════
+#define BAT_ADC  34
+#define TFT_BL    4
+const int BTN_NEXT = 0;
+const int BTN_ACT  = 35;
+
+#define BL_LEDC_CH   0
+#define BL_LEDC_FREQ 5000
+#define BL_LEDC_RES  8
+
+// ═══════════════════════════════════════════════════════════
+// Display / global objects
+// ═══════════════════════════════════════════════════════════
+TFT_eSPI    tft;
+Preferences prefs;
+
+const int ROT = 0;
+const int M   = 12;
+
+inline int footerY()  { return tft.height() - FOOTER_H; }
+inline int contentH() { return tft.height() - HEADER_H - FOOTER_H; }
+
+// ═══════════════════════════════════════════════════════════
+// Defensive bounds
+// ═══════════════════════════════════════════════════════════
+#define SAFE_SEL (netCount > 0 ? constrain(sel, 0, netCount - 1) : 0)
+
+// ═══════════════════════════════════════════════════════════
+// Settings  (Phase 4, unchanged)
+// ═══════════════════════════════════════════════════════════
+enum SortMode : uint8_t {
+  SORT_RSSI = 0, SORT_RISK = 1, SORT_OPEN = 2, SORT_CHANNEL = 3, SORT_COUNT = 4
+};
+
+struct Settings {
+  uint8_t  brightness;
+  uint16_t sleepSec;
+  SortMode sortMode;
+  bool     showBSSID;
+  bool     hideHidden;
+};
+Settings settings = { 200, 60, SORT_RSSI, true, false };
+inline uint32_t idleToSleepMs() { return (uint32_t)settings.sleepSec * 1000UL; }
+
+// ═══════════════════════════════════════════════════════════
+// State machine
+// ═══════════════════════════════════════════════════════════
+enum ScreenState { HOME, LIST, ANALYZE, PORTAL_RESULT, SETTINGS };
+ScreenState state = HOME;
+
+// ═══════════════════════════════════════════════════════════
+// Timing
+// ═══════════════════════════════════════════════════════════
+uint32_t lastInteractionMs  = 0;
+uint32_t ignoreInputUntilMs = 0;
+uint32_t lastIdleAnimMs     = 0;
+uint8_t  idleFrame          = 0;
+
+// ═══════════════════════════════════════════════════════════
+// Data model
+// ═══════════════════════════════════════════════════════════
+struct Net {
+  String ssid;
+  int    rssi;
+  wifi_auth_mode_t enc;
+  String bssid;
+  int    channel;
+};
+
+Net  nets[25];
+int  netCount       = 0;
+int  sel            = 0;
+bool hasScannedOnce = false;
+
+enum PortalResult {
+  PORTAL_NOT_TESTED, PORTAL_NO_PORTAL, PORTAL_PORTAL_LIKELY,
+  PORTAL_NO_INTERNET, PORTAL_CONNECT_FAIL, PORTAL_NEEDS_PASSWORD
+};
+PortalResult portalRes[25];
+
+// ═══════════════════════════════════════════════════════════
+// [P5-1] RiskFactor + RiskCache
+// ═══════════════════════════════════════════════════════════
+struct RiskFactor {
+  char    label[24];
+  int8_t  delta;
+};
+
+static const int MAX_FACTORS = 5;
+
+struct RiskEntry {
+  int8_t     score;        // −1 = not computed yet
+  uint8_t    factorCount;
+  RiskFactor factors[MAX_FACTORS];
+};
+
+RiskEntry riskCache[25];
+
+// Invalidate all cache entries (called before computeAllRisk)
+void invalidateRiskCache() {
+  for (int i = 0; i < 25; i++) {
+    riskCache[i].score = -1;
+    riskCache[i].factorCount = 0;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// [P5-6] NEW marker data
+// ═══════════════════════════════════════════════════════════
+uint64_t prevBSSIDs[25];   // packed from previous scan; zero = not seen
+bool     isNew[25];        // true if this BSSID wasn't in prevBSSIDs
+
+// Pack BSSID string "AA:BB:CC:DD:EE:FF" → uint64_t (bottom 6 bytes)
+uint64_t packBSSID(const String& b) {
+  if (b.length() < 17) return 0ULL;
+  uint64_t v = 0;
+  // parse 6 hex pairs
+  const char* p = b.c_str();
+  for (int i = 0; i < 6; i++) {
+    uint8_t hi = p[i*3],   lo = p[i*3+1];
+    auto hexNib = [](char c) -> uint8_t {
+      if (c >= '0' && c <= '9') return c - '0';
+      if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+      if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+      return 0;
+    };
+    v = (v << 8) | ((hexNib(hi) << 4) | hexNib(lo));
+  }
+  return v;
+}
+
+// Called after scan to mark new APs
+void updateNewMarkers() {
+  for (int i = 0; i < netCount; i++) {
+    uint64_t packed = packBSSID(nets[i].bssid);
+    isNew[i] = true;
+    if (packed == 0ULL) { isNew[i] = false; continue; }
+    for (int j = 0; j < 25; j++) {
+      if (prevBSSIDs[j] == packed) { isNew[i] = false; break; }
+    }
+  }
+  // Save current BSSIDs as previous for next scan
+  memset(prevBSSIDs, 0, sizeof(prevBSSIDs));
+  for (int i = 0; i < netCount && i < 25; i++)
+    prevBSSIDs[i] = packBSSID(nets[i].bssid);
+}
+
+// ═══════════════════════════════════════════════════════════
+// [P5-3] Channel congestion helper
+//
+//  channelCounts[ch] = number of APs on that channel (1-indexed, [0] unused)
+//  overlapCount(ch)  = APs on channels that could interfere with ch
+//  (2.4GHz channels overlap if |ch_a - ch_b| <= 4)
+// ═══════════════════════════════════════════════════════════
+static int channelCounts[15] = {0};  // index 1–14 used; index 0 unused
+
+void buildChannelCounts() {
+  memset(channelCounts, 0, sizeof(channelCounts));
+  for (int i = 0; i < netCount; i++) {
+    int ch = nets[i].channel;
+    if (ch >= 1 && ch <= 14) channelCounts[ch]++;
+    // 5GHz channels are far apart, skip congestion penalty for ch > 14
+  }
+}
+
+int overlapCount(int ch) {
+  if (ch < 1 || ch > 14) return 0;
+  int total = 0;
+  for (int c = max(1, ch - 4); c <= min(14, ch + 4); c++) {
+    if (c != ch) total += channelCounts[c];
+  }
+  total += channelCounts[ch] - 1;  // other APs on same channel (exclude self)
+  return max(0, total);
+}
+
+// ═══════════════════════════════════════════════════════════
+// [P5-2] computeRisk — fills RiskEntry for nets[idx]
+//  Must be called after buildChannelCounts().
+// ═══════════════════════════════════════════════════════════
+
+// Helper: add factor if slot available
+static void addFactor(RiskEntry& e, const char* label, int8_t delta) {
+  if (e.factorCount >= MAX_FACTORS) return;
+  strncpy(e.factors[e.factorCount].label, label, 23);
+  e.factors[e.factorCount].label[23] = '\0';
+  e.factors[e.factorCount].delta = delta;
+  e.factorCount++;
+}
+
+void computeRisk(int idx) {
+  if (idx < 0 || idx >= netCount) return;
+  RiskEntry& e   = riskCache[idx];
+  const Net&  n  = nets[idx];
+  PortalResult pr = portalRes[idx];
+
+  e.score       = 0;
+  e.factorCount = 0;
+
+  // ── Encryption ────────────────────────────────────────
+  int encScore = 0;
+  const char* encLabel = "";
+  switch (n.enc) {
+    case WIFI_AUTH_OPEN:          encScore = 60; encLabel = "No encryption";    break;
+    case WIFI_AUTH_WEP:           encScore = 45; encLabel = "WEP (broken)";     break;
+    case WIFI_AUTH_WPA_PSK:       encScore = 22; encLabel = "WPA (weak)";       break;
+    case WIFI_AUTH_WPA_WPA2_PSK:  encScore = 20; encLabel = "WPA/WPA2 mixed";   break;
+    case WIFI_AUTH_WPA2_PSK:      encScore =  8; encLabel = "WPA2";             break;
+    case WIFI_AUTH_WPA3_PSK:      encScore =  3; encLabel = "WPA3 (strong)";    break;
+    case WIFI_AUTH_WPA2_WPA3_PSK: encScore =  5; encLabel = "WPA2/WPA3";        break;
+    default:                      encScore = 12; encLabel = "Unknown enc";      break;
+  }
+  if (encScore > 0) { e.score += encScore; addFactor(e, encLabel, encScore); }
+
+  // ── Signal quality ────────────────────────────────────
+  int sigScore = 0;
+  if      (n.rssi < -85) sigScore = 12;
+  else if (n.rssi < -75) sigScore =  8;
+  else if (n.rssi < -65) sigScore =  4;
+  if (sigScore > 0) { e.score += sigScore; addFactor(e, "Weak signal", sigScore); }
+
+  // ── SSID keywords ─────────────────────────────────────
+  String sl = n.ssid; sl.toLowerCase();
+  int kwScore = 0; const char* kwLabel = "";
+  if      (sl.indexOf("free")      >= 0) { kwScore = 10; kwLabel = "\"free\" in name"; }
+  else if (sl.indexOf("starbucks") >= 0) { kwScore =  5; kwLabel = "Coffee shop AP";   }
+  else if (sl.indexOf("airport")   >= 0) { kwScore =  5; kwLabel = "Airport AP";       }
+  else if (sl.indexOf("hotel")     >= 0) { kwScore =  5; kwLabel = "Hotel AP";         }
+  else if (sl.indexOf("public")    >= 0) { kwScore =  5; kwLabel = "Public AP";        }
+  else if (sl.indexOf("guest")     >= 0) { kwScore =  5; kwLabel = "Guest network";    }
+  else if (sl.indexOf("cafe")      >= 0) { kwScore =  3; kwLabel = "Cafe AP";          }
+  if (kwScore > 0) { e.score += kwScore; addFactor(e, kwLabel, kwScore); }
+
+  // ── Portal result ─────────────────────────────────────
+  int portalScore = 0; const char* portalLabel = "";
+  switch (pr) {
+    case PORTAL_PORTAL_LIKELY: portalScore = 15; portalLabel = "Captive portal";   break;
+    case PORTAL_NO_INTERNET:   portalScore =  8; portalLabel = "No internet";      break;
+    case PORTAL_CONNECT_FAIL:  portalScore =  5; portalLabel = "Connect failed";   break;
+    case PORTAL_NO_PORTAL:     portalScore = -5; portalLabel = "Clean (no portal)";break;
+    default: break;
+  }
+  if (portalScore != 0) { e.score += portalScore; addFactor(e, portalLabel, portalScore); }
+
+  // ── Channel congestion ────────────────────────────────
+  int ch = n.channel;
+  if (ch >= 1 && ch <= 14) {
+    int oc = overlapCount(ch);
+    int congScore = constrain(oc * 2, 0, 10);
+    if (congScore > 0) { e.score += congScore; addFactor(e, "Channel congested", congScore); }
+  }
+
+  // ── Final cap ─────────────────────────────────────────
+  e.score = constrain(e.score, 0, 100);
+}
+
+void computeAllRisk() {
+  buildChannelCounts();
+  for (int i = 0; i < netCount; i++) computeRisk(i);
+}
+
+// ── Accessor helpers (replaces old riskScore / riskScoreWithPortal)
+int cachedRiskScore(int idx) {
+  if (idx < 0 || idx >= netCount) return 0;
+  if (riskCache[idx].score < 0) computeRisk(idx);
+  return riskCache[idx].score;
+}
+
+// Called from showAnalysis with current sel
+int riskScoreForSel() { return cachedRiskScore(SAFE_SEL); }
+
+String riskLabel(int s) {
+  if (s >= 70) return "HIGH";
+  if (s >= 35) return "MED";
+  return "LOW";
+}
+uint16_t riskColor(int s) {
+  if (s >= 70) return TFT_RED;
+  if (s >= 35) return TFT_ORANGE;
+  return TFT_GREEN;
+}
+
+// ═══════════════════════════════════════════════════════════
+// NVS  (Phase 4)
+// ═══════════════════════════════════════════════════════════
+void loadSettings() {
+  prefs.begin("wfg", true);
+  settings.brightness = prefs.getUChar("bright",    200);
+  settings.sleepSec   = prefs.getUShort("sleepSec",  60);
+  settings.sortMode   = (SortMode)prefs.getUChar("sortMode", SORT_RSSI);
+  settings.showBSSID  = prefs.getBool("showBSSID",  true);
+  settings.hideHidden = prefs.getBool("hideHidden", false);
+  prefs.end();
+  settings.brightness = constrain(settings.brightness, 10, 255);
+  if (settings.sortMode >= SORT_COUNT) settings.sortMode = SORT_RSSI;
+  uint16_t vs[] = {30,60,120,300}; bool ok=false;
+  for (auto v:vs) if(settings.sleepSec==v){ok=true;break;}
+  if (!ok) settings.sleepSec = 60;
+}
+
+void saveSettings() {
+  prefs.begin("wfg", false);
+  prefs.putUChar("bright",   settings.brightness);
+  prefs.putUShort("sleepSec",settings.sleepSec);
+  prefs.putUChar("sortMode", (uint8_t)settings.sortMode);
+  prefs.putBool("showBSSID", settings.showBSSID);
+  prefs.putBool("hideHidden",settings.hideHidden);
+  prefs.end();
+}
+
+// ═══════════════════════════════════════════════════════════
+// Backlight  (Phase 4)
+// ═══════════════════════════════════════════════════════════
+void initBacklight() {
+  ledcSetup(BL_LEDC_CH, BL_LEDC_FREQ, BL_LEDC_RES);
+  ledcAttachPin(TFT_BL, BL_LEDC_CH);
+}
+void applyBrightness(uint8_t val) { ledcWrite(BL_LEDC_CH, val); }
+
+// ═══════════════════════════════════════════════════════════
+// Buttons  (Phase 1 + 4)
+// ═══════════════════════════════════════════════════════════
+enum BtnEvent { BTN_NONE, BTN_TAP, BTN_LONG };
+static const uint16_t BTN_LONG_THRESH = 800;
+static const uint16_t BTN_MAX_WAIT    = 1500;
+static const uint16_t BTN_DEBOUNCE_MS = 12;
+
+BtnEvent readBtn(int pin) {
+  if (digitalRead(pin) != LOW) return BTN_NONE;
+  delay(BTN_DEBOUNCE_MS);
+  if (digitalRead(pin) != LOW) return BTN_NONE;
+  uint32_t ps = millis(); uint32_t el = 0;
+  while (digitalRead(pin) == LOW) {
+    el = millis() - ps;
+    if (el >= BTN_MAX_WAIT) break;
+    delay(5);
+  }
+  delay(BTN_DEBOUNCE_MS);
+  return (el >= BTN_LONG_THRESH) ? BTN_LONG : BTN_TAP;
+}
+
+bool chordHeld(uint32_t holdMs = 1000) {
+  uint32_t win = millis();
+  while (millis() - win < 250) {
+    if (digitalRead(BTN_NEXT) == LOW && digitalRead(BTN_ACT) == LOW) break;
+    delay(5);
+  }
+  if (!(digitalRead(BTN_NEXT) == LOW && digitalRead(BTN_ACT) == LOW)) return false;
+  uint32_t hs = millis();
+  while (millis() - hs < holdMs) {
+    if (!(digitalRead(BTN_NEXT) == LOW && digitalRead(BTN_ACT) == LOW)) return false;
+    delay(10);
+  }
+  while (digitalRead(BTN_NEXT) == LOW || digitalRead(BTN_ACT) == LOW) delay(5);
+  return true;
+}
+
+// ═══════════════════════════════════════════════════════════
+// Utility helpers  (Phase 1–4)
+// ═══════════════════════════════════════════════════════════
+String encToStr(wifi_auth_mode_t e) {
+  switch (e) {
+    case WIFI_AUTH_OPEN: return "OPEN"; case WIFI_AUTH_WEP: return "WEP";
+    case WIFI_AUTH_WPA_PSK: return "WPA"; case WIFI_AUTH_WPA2_PSK: return "WPA2";
+    case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/2"; case WIFI_AUTH_WPA3_PSK: return "WPA3";
+    case WIFI_AUTH_WPA2_WPA3_PSK: return "WP2/3"; default: return "UNK";
+  }
+}
+String encTag(wifi_auth_mode_t e) {
+  switch (e) {
+    case WIFI_AUTH_OPEN: return "OPEN"; case WIFI_AUTH_WEP: return "WEP ";
+    case WIFI_AUTH_WPA_PSK: return "WPA "; case WIFI_AUTH_WPA2_PSK: return "WPA2";
+    case WIFI_AUTH_WPA_WPA2_PSK: return "WP/2"; case WIFI_AUTH_WPA3_PSK: return "WPA3";
+    case WIFI_AUTH_WPA2_WPA3_PSK: return "W2/3"; default: return "UNK ";
+  }
+}
+String safeSSID(const String& s, int maxChars) {
+  String t=s; t.trim();
+  if (t.length()==0) return "(hidden)";
+  String out=""; bool rem=false;
+  for (int i=0;i<(int)t.length();i++){
+    char c=t[i];
+    if (c>=32&&c<=126) out+=c; else rem=true;
+  }
+  if (out.length()==0) return rem?"(non-ascii)":"(hidden)";
+  if ((int)out.length()>maxChars) out=out.substring(0,maxChars-2)+"..";
+  return out;
+}
+String bssidSuffix(const String& bssid) {
+  if (!settings.showBSSID) return "";
+  if (bssid.length()<17) return "";
+  return bssid.substring(12);
+}
+String portalToStr(PortalResult pr) {
+  switch (pr) {
+    case PORTAL_NOT_TESTED: return "Not tested"; case PORTAL_NO_PORTAL: return "No portal";
+    case PORTAL_PORTAL_LIKELY: return "Portal likely"; case PORTAL_NO_INTERNET: return "No internet";
+    case PORTAL_CONNECT_FAIL: return "Connect fail"; case PORTAL_NEEDS_PASSWORD: return "Needs password";
+    default: return "Unknown";
+  }
+}
+uint16_t portalColor(PortalResult pr) {
+  switch (pr) {
+    case PORTAL_NO_PORTAL: return TFT_GREEN; case PORTAL_PORTAL_LIKELY: return TFT_ORANGE;
+    case PORTAL_NO_INTERNET: return TFT_RED; case PORTAL_CONNECT_FAIL: return TFT_RED;
+    default: return TFT_DARKGREY;
+  }
+}
+String sortModeStr(SortMode m) {
+  switch (m) {
+    case SORT_RSSI: return "Signal (RSSI)"; case SORT_RISK: return "Risk score";
+    case SORT_OPEN: return "OPEN first";    case SORT_CHANNEL: return "Channel";
+    default: return "?";
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Sort  (Phase 4 — now calls cachedRiskScore for SORT_RISK)
+// ═══════════════════════════════════════════════════════════
+void swapNet(int a, int b) {
+  Net tmp=nets[a]; nets[a]=nets[b]; nets[b]=tmp;
+  PortalResult ptmp=portalRes[a]; portalRes[a]=portalRes[b]; portalRes[b]=ptmp;
+  RiskEntry rtmp=riskCache[a]; riskCache[a]=riskCache[b]; riskCache[b]=rtmp;
+  bool ntmp=isNew[a]; isNew[a]=isNew[b]; isNew[b]=ntmp;
+}
+
+void sortNets() {
+  if (netCount<=1) return;
+  for (int i=1;i<netCount;i++){
+    int j=i;
+    while (j>0){
+      bool doSwap=false;
+      switch (settings.sortMode){
+        case SORT_RSSI:    doSwap=(nets[j].rssi>nets[j-1].rssi); break;
+        case SORT_RISK:    doSwap=(cachedRiskScore(j)>cachedRiskScore(j-1)); break;
+        case SORT_OPEN: {
+          bool jO=(nets[j].enc==WIFI_AUTH_OPEN), j1O=(nets[j-1].enc==WIFI_AUTH_OPEN);
+          if (jO&&!j1O) doSwap=true;
+          else if (jO==j1O) doSwap=(nets[j].rssi>nets[j-1].rssi);
+          break;
+        }
+        case SORT_CHANNEL: doSwap=(nets[j].channel<nets[j-1].channel); break;
+        default: break;
+      }
+      if (doSwap){swapNet(j,j-1);j--;} else break;
+    }
+  }
+  sel=0;
+}
+
+// ═══════════════════════════════════════════════════════════
+// Battery
+// ═══════════════════════════════════════════════════════════
+float readBatteryVoltage() {
+  const int N=20; uint32_t sum=0;
+  for (int i=0;i<N;i++){sum+=analogRead(BAT_ADC);delay(2);}
+  return (sum/(float)N/4095.0f)*3.3f*2.0f*1.05f;
+}
+int batteryPct(float v) {
+  if (v>=4.20f) return 100; if (v<=3.00f) return 0;
+  return (int)((v-3.00f)*(100.0f/1.20f));
+}
+
+// ═══════════════════════════════════════════════════════════
+// resetTextState
+// ═══════════════════════════════════════════════════════════
+void resetTextState() {
+  tft.setTextFont(2); tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE,TFT_BLACK);
+  tft.setTextWrap(false,false);
+}
+
+// ═══════════════════════════════════════════════════════════
+// Battery widget
+// ═══════════════════════════════════════════════════════════
+void drawBatteryWidget() {
+  int pct=constrain(batteryPct(readBatteryVoltage()),0,100);
+  int bx=tft.width()-34,by=9,bw=18,bh=10;
+  tft.fillRect(tft.width()-60,0,60,HEADER_H,TFT_DARKGREY);
+  tft.drawRect(bx,by,bw,bh,TFT_WHITE);
+  tft.fillRect(bx+bw,by+3,2,bh-6,TFT_WHITE);
+  int fw=(bw-4)*pct/100;
+  uint16_t c=(pct<20)?TFT_RED:(pct<50?TFT_YELLOW:TFT_GREEN);
+  tft.fillRect(bx+2,by+2,fw,bh-4,c);
+  tft.setTextFont(1);tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE,TFT_DARKGREY);
+  tft.setCursor(tft.width()-58,10);tft.printf("%d%%",pct);
+}
+
+// ═══════════════════════════════════════════════════════════
+// Core layout helpers
+// ═══════════════════════════════════════════════════════════
+void drawHeader(const char* title) {
+  tft.fillRect(0,0,tft.width(),HEADER_H,TFT_DARKGREY);
+  resetTextState();
+  tft.setTextColor(TFT_WHITE,TFT_DARKGREY);
+  tft.setCursor(M,8);tft.print(title);
+  drawBatteryWidget();
+}
+void clearContent() {
+  tft.fillRect(0,CONTENT_Y,tft.width(),tft.height()-CONTENT_Y,TFT_BLACK);
+}
+void drawFooterHint(const char* l, const char* r) {
+  int fy=footerY(),w=tft.width();
+  tft.fillRect(0,fy,w,FOOTER_H,TFT_DARKGREY);
+  tft.setTextFont(1);tft.setTextSize(1);tft.setTextColor(TFT_WHITE,TFT_DARKGREY);
+  if (l&&l[0]){tft.setCursor(M,fy+4);tft.print(l);}
+  if (r&&r[0]){tft.setCursor(w-M-tft.textWidth(r),fy+4);tft.print(r);}
+}
+void drawStatusBox(const String& txt, uint16_t color) {
+  int w=tft.width(),y=CONTENT_Y+6,h=28,maxW=(w-2*M)-16;
+  tft.drawRect(M,y,w-2*M,h,TFT_WHITE);
+  tft.fillRect(M+1,y+1,w-2*M-2,h-2,TFT_BLACK);
+  resetTextState();
+  String s=txt;
+  if (tft.textWidth(s)>maxW) tft.setTextFont(1);
+  while (s.length()>0&&tft.textWidth(s+"..")>maxW) s.remove(s.length()-1);
+  tft.setTextColor(color,TFT_BLACK);tft.setCursor(M+8,y+7);tft.print(s);
+}
+
+// ═══════════════════════════════════════════════════════════
+// Phase 2 drawing primitives
+// ═══════════════════════════════════════════════════════════
+void drawSignalBars(int rssi,int x,int y,uint16_t bg=TFT_BLACK){
+  const int BAR_W=3,GAP=1,BARS=4,MAX_H=9,WIDGET_W=BARS*BAR_W+(BARS-1)*GAP;
+  tft.fillRect(x,y,WIDGET_W,MAX_H+1,bg);
+  int ab=(rssi>=-60)?4:(rssi>=-70)?3:(rssi>=-80)?2:1;
+  int h4[4]={3,5,7,9};
+  for(int i=0;i<BARS;i++){
+    int bx=x+i*(BAR_W+GAP),bh=h4[i];
+    tft.fillRect(bx,y+MAX_H-bh,BAR_W,bh,(i<ab)?(uint16_t)TFT_GREEN:(uint16_t)TFT_DARKGREY);
+  }
+}
+void drawLockIcon(wifi_auth_mode_t enc,int x,int y,uint16_t bg=TFT_BLACK){
+  tft.fillRect(x,y-2,10,15,bg);
+  uint16_t col; bool isOpen;
+  switch(enc){
+    case WIFI_AUTH_OPEN: case WIFI_AUTH_WEP: col=TFT_RED;isOpen=true;break;
+    case WIFI_AUTH_WPA_PSK: case WIFI_AUTH_WPA_WPA2_PSK: col=TFT_ORANGE;isOpen=false;break;
+    default: col=TFT_GREEN;isOpen=false;break;
+  }
+  tft.fillRect(x,y+6,10,6,col);tft.fillRect(x+3,y+8,4,3,TFT_BLACK);
+  tft.fillRect(x+1,y+1,2,6,col);
+  if(!isOpen){tft.fillRect(x+7,y+1,2,6,col);tft.fillRect(x+1,y,8,2,col);}
+  else{tft.fillRect(x+7,y-2,2,5,col);}
+}
+void drawProgressBar(int x,int y,int w,int h,int pct,uint16_t color){
+  pct=constrain(pct,0,100);
+  tft.drawRect(x,y,w,h,TFT_WHITE);tft.fillRect(x+1,y+1,w-2,h-2,TFT_BLACK);
+  int fill=(w-2)*pct/100;
+  if(fill>0)tft.fillRect(x+1,y+1,fill,h-2,color);
+}
+void drawFittedText(const String& raw,int x,int y,int maxW,uint16_t fg,uint16_t bg){
+  String s=safeSSID(raw,64);
+  resetTextState();tft.setTextFont(2);
+  if(tft.textWidth(s)>maxW)tft.setTextFont(1);
+  while(s.length()>0&&tft.textWidth(s+"..")>maxW)s.remove(s.length()-1);
+  tft.setTextColor(fg,bg);tft.setCursor(x,y);tft.print(s);
+}
+void drawFittedTextBig(const String& text,int x,int y,int maxW,uint16_t fg,uint16_t bg){
+  String s=text;s.trim();if(s.length()==0)s="(hidden)";
+  resetTextState();tft.setTextSize(2);tft.setTextFont(2);
+  if(tft.textWidth(s)>maxW)tft.setTextSize(1);
+  while(s.length()>0&&tft.textWidth(s+"..")>maxW)s.remove(s.length()-1);
+  tft.setTextColor(fg,bg);tft.setCursor(x,y);tft.print(s);tft.setTextSize(1);
+}
+
+// ═══════════════════════════════════════════════════════════
+// IndeterBar  (Phase 3)
+// ═══════════════════════════════════════════════════════════
+struct IndeterBar {
+  int x,y,w,h;uint16_t color;int blockPos,blockW;int8_t dir;uint32_t lastTickMs;
+  static const int TICK_MS=40,SPEED=5;
+  void begin(int _x,int _y,int _w,int _h,uint16_t _c){
+    x=_x;y=_y;w=_w;h=_h;color=_c;
+    blockW=max(12,_w/4);blockPos=0;dir=1;lastTickMs=0;
+    tft.drawRect(x,y,w,h,TFT_WHITE);tft.fillRect(x+1,y+1,w-2,h-2,TFT_DARKGREY);
+  }
+  void tick(uint32_t now){
+    if(now-lastTickMs<(uint32_t)TICK_MS)return;lastTickMs=now;
+    int interior=w-2;tft.fillRect(x+1,y+1,interior,h-2,TFT_DARKGREY);
+    int bx=x+1+blockPos,bw=min(blockW,interior-blockPos);
+    if(bw>0)tft.fillRect(bx,y+1,bw,h-2,color);
+    blockPos+=dir*SPEED;
+    if(blockPos+blockW>=interior){blockPos=interior-blockW;dir=-1;}
+    if(blockPos<=0){blockPos=0;dir=1;}
+  }
+  void complete(){tft.fillRect(x+1,y+1,w-2,h-2,color);}
+  void error(){tft.fillRect(x+1,y+1,w-2,h-2,TFT_RED);}
+};
+
+// ═══════════════════════════════════════════════════════════
+// Toast  (Phase 3)
+// ═══════════════════════════════════════════════════════════
+struct Toast{bool active;uint32_t showMs,durationMs;int x,y,w,h;char msg[40];uint16_t color;};
+static Toast g_toast={false,0,0,0,0,0,0,{},TFT_WHITE};
+void showToast(const char* msg,uint16_t color=TFT_WHITE,uint32_t dur=1800){
+  int tw=tft.width()-2*M,th=18,tx=M,ty=footerY()-th-4;
+  tft.fillRect(tx,ty,tw,th,TFT_DARKGREY);tft.drawRect(tx,ty,tw,th,TFT_WHITE);
+  tft.setTextFont(1);tft.setTextSize(1);tft.setTextColor(color,TFT_DARKGREY);
+  int textW=tft.textWidth(msg);
+  tft.setCursor(tx+(tw-textW)/2,ty+5);tft.print(msg);
+  g_toast={true,millis(),dur,tx,ty,tw,th,{},color};
+  strncpy(g_toast.msg,msg,sizeof(g_toast.msg)-1);g_toast.msg[sizeof(g_toast.msg)-1]='\0';
+}
+void tickToast(uint32_t now){
+  if(!g_toast.active)return;
+  if(now-g_toast.showMs>=g_toast.durationMs){
+    tft.fillRect(g_toast.x,g_toast.y,g_toast.w,g_toast.h,TFT_BLACK);
+    g_toast.active=false;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Phase 2 LIST geometry  (unchanged)
+// ═══════════════════════════════════════════════════════════
+static const int LP_PAD=4,LP_ROWS=4;
+static int listPanelY(){return CONTENT_Y+84;}
+static const int SSID_BOX_Y=CONTENT_Y+18,SSID_BOX_H=40;
+static const int INFO_ROW_Y=CONTENT_Y+18+40+6,INFO_ROW_H=14;
+
+// [P5-6] drawListPanel updated: show "NEW" in magenta when isNew[idx]
+void drawListPanel(){
+  if(netCount<=0)return;
+  int w=tft.width(),pX=M,pY=listPanelY(),pW=w-2*M,pH=footerY()-pY-2;
+  if(pH<LP_ROWS*12)return;
+  int rowH=(pH-2*LP_PAD)/LP_ROWS;
+  tft.drawRect(pX,pY,pW,pH,TFT_WHITE);tft.fillRect(pX+1,pY+1,pW-2,pH-2,TFT_BLACK);
+  const int COL_LOCK=pX+4,LOCK_W=10,COL_SSID=pX+4+LOCK_W+4;
+  const int COL_BARS=pX+pW-4-15-4-24,COL_TAG=pX+pW-4-24;
+  const int SSID_MAXW=COL_BARS-COL_SSID-2;
+  for(int i=0;i<LP_ROWS;i++){
+    if(i>=netCount)break;
+    int idx=(SAFE_SEL+i)%netCount,ry=pY+LP_PAD+i*rowH;
+    bool isSel=(i==0);
+    uint16_t rowBg=isSel?(uint16_t)TFT_DARKGREY:(uint16_t)TFT_BLACK;
+    uint16_t rowFg=isSel?(uint16_t)TFT_BLACK:(uint16_t)TFT_WHITE;
+    tft.fillRect(pX+2,ry,pW-4,rowH,rowBg);
+    drawLockIcon(nets[idx].enc,COL_LOCK,ry+(rowH-12)/2,rowBg);
+    drawFittedText(nets[idx].ssid,COL_SSID,ry+(rowH-14)/2,SSID_MAXW,rowFg,rowBg);
+    drawSignalBars(nets[idx].rssi,COL_BARS,ry+(rowH-9)/2,rowBg);
+    tft.setTextFont(1);tft.setTextSize(1);
+    // [P5-6] NEW tag overrides sec tag when isNew
+    if(isNew[idx]){
+      tft.setTextColor(TFT_MAGENTA,rowBg);
+      tft.setCursor(COL_TAG,ry+(rowH-8)/2);tft.print("NEW!");
+    } else {
+      tft.setTextColor(isSel?(uint16_t)TFT_DARKGREY:(uint16_t)TFT_CYAN,rowBg);
+      tft.setCursor(COL_TAG,ry+(rowH-8)/2);tft.print(encTag(nets[idx].enc));
+    }
+  }
+}
+
+void drawSSIDBox(){
+  if(netCount<=0)return;
+  int w=tft.width(),maxW=(w-2*M)-16;
+  const Net& n=nets[SAFE_SEL];
+  tft.fillRect(M+1,SSID_BOX_Y+1,w-2*M-2,SSID_BOX_H-2,TFT_BLACK);
+  drawFittedTextBig(n.ssid,M+8,SSID_BOX_Y+8,maxW-38,TFT_GREEN,TFT_BLACK);
+  String suf=bssidSuffix(n.bssid);
+  if(suf.length()>0){
+    tft.setTextFont(1);tft.setTextSize(1);tft.setTextColor(TFT_DARKGREY,TFT_BLACK);
+    tft.setCursor(M+maxW-tft.textWidth(suf),SSID_BOX_Y+SSID_BOX_H-12);tft.print(suf);
+  }
+  // [P5-6] "NEW" indicator in SSID box top-right corner
+  if(netCount>0&&isNew[SAFE_SEL]){
+    tft.setTextFont(1);tft.setTextSize(1);tft.setTextColor(TFT_MAGENTA,TFT_BLACK);
+    tft.setCursor(M+maxW-20,SSID_BOX_Y+3);tft.print("NEW");
+  }
+}
+
+void drawInfoRow(){
+  if(netCount<=0)return;
+  int w=tft.width(),y=INFO_ROW_Y;
+  const Net& n=nets[SAFE_SEL];
+  tft.fillRect(M,y,w-2*M,INFO_ROW_H,TFT_BLACK);
+  drawLockIcon(n.enc,M,y+1,TFT_BLACK);
+  tft.setTextFont(1);tft.setTextSize(1);
+  tft.setTextColor(TFT_CYAN,TFT_BLACK);tft.setCursor(M+14,y+3);tft.print(encTag(n.enc));
+  int barsX=M+14+26;
+  drawSignalBars(n.rssi,barsX,y+2,TFT_BLACK);
+  tft.setTextColor(TFT_DARKGREY,TFT_BLACK);tft.setCursor(barsX+18,y+3);tft.printf("%d",n.rssi);
+  tft.setTextColor(TFT_WHITE,TFT_BLACK);tft.setCursor(w/2+10,y+3);tft.printf("Ch:%d",n.channel);
+  tft.setTextColor(TFT_YELLOW,TFT_BLACK);tft.setCursor(w-M-28,y+3);tft.printf("%d/%d",sel+1,netCount);
+}
+
+void updateListSelectionUIDirty(){
+  if(netCount<=0)return;
+  drawSSIDBox();drawInfoRow();
+  int w=tft.width(),pX=M,pY=listPanelY(),pW=w-2*M,pH=footerY()-pY-2;
+  tft.fillRect(pX+1,pY+1,pW-2,pH-2,TFT_BLACK);drawListPanel();
+}
+
+// ═══════════════════════════════════════════════════════════
+// LIST screen
+// ═══════════════════════════════════════════════════════════
+void showList(){
+  clearContent();drawHeader("WiFiGuard");
+  if(netCount<=0){drawStatusBox("NO NETWORKS FOUND",TFT_RED);drawFooterHint("","R: Rescan");return;}
+  resetTextState();tft.setTextColor(TFT_DARKGREY,TFT_BLACK);
+  tft.setCursor(M,CONTENT_Y+4);tft.printf("Networks: %d",netCount);
+  tft.drawRect(M,SSID_BOX_Y,tft.width()-2*M,SSID_BOX_H,TFT_WHITE);
+  drawSSIDBox();drawInfoRow();drawListPanel();
+  drawFooterHint("L: Next","R: Analyze  Hold: Rescan");
+}
+
+// ═══════════════════════════════════════════════════════════
+// [P5-5] ANALYZE screen — adds "Why?" risk factor bullets
+// ═══════════════════════════════════════════════════════════
+void showAnalysis(const Net& n) {
+  clearContent();
+  drawHeader("Analyze");
+
+  int idx   = SAFE_SEL;
+  int score = cachedRiskScore(idx);
+
+  drawStatusBox(riskLabel(score) + "  " + String(score) + "/100", riskColor(score));
+
+  int barY = CONTENT_Y + 40, barW = tft.width() - 2*M;
+  drawProgressBar(M, barY, barW, 8, score, riskColor(score));
+
+  const int lx = M, vx = M + 66, lineH = 15;
+  int y = barY + 14;
+  resetTextState(); tft.setTextFont(2); tft.setTextSize(1);
+
+  auto row = [&](const char* label, const String& val,
+                 uint16_t valColor, bool withBars = false) {
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK); tft.setCursor(lx, y); tft.print(label);
+    if (withBars) {
+      tft.setTextColor(valColor, TFT_BLACK); tft.setCursor(vx, y); tft.print(val);
+      drawSignalBars(nets[idx].rssi, vx + tft.textWidth(val) + 4, y + 2, TFT_BLACK);
+    } else {
+      tft.setTextColor(valColor, TFT_BLACK); tft.setCursor(vx, y);
+      int maxVW = tft.width() - vx - M; String v = val;
+      while (v.length() > 0 && tft.textWidth(v + "..") > maxVW) v.remove(v.length()-1);
+      tft.print(v);
+    }
+    y += lineH;
+  };
+
+  row("SSID:",     safeSSID(n.ssid, 16),              TFT_GREEN);
+  row("Signal:",   String(n.rssi) + " dBm",           TFT_CYAN,  true);
+  row("Security:", encToStr(n.enc),                   TFT_WHITE);
+  row("Channel:",  String(n.channel),                 TFT_WHITE);
+  row("Portal:",   portalToStr(portalRes[idx]),        portalColor(portalRes[idx]));
+
+  drawLockIcon(n.enc, lx, y - lineH * 3 + 2, TFT_BLACK);
+
+  // ── BSSID (hidden when showBSSID = false) ─────────────
+  if (settings.showBSSID) {
+    y += 2;
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.setTextFont(2); tft.setTextSize(1); tft.setCursor(lx, y); tft.print("BSSID:");
+    tft.setTextFont(1); tft.setTextSize(1); tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    String b = n.bssid; b.trim();
+    if (b.length() >= 17) {
+      tft.setCursor(vx, y);     tft.print(b.substring(0, 8));
+      tft.setCursor(vx, y+11);  tft.print(b.substring(9, 17));
+      y += 22;
+    } else {
+      tft.setCursor(vx, y); tft.print(b);
+      y += 12;
+    }
+  } else {
+    y += 4;
+  }
+
+  // ── [P5-5] "Why?" risk factor bullets ─────────────────
+  // Only draw if there's vertical space and factors exist
+  const RiskEntry& re = riskCache[idx];
+  int numFactors = min((int)re.factorCount, 3);  // top 3
+
+  if (numFactors > 0 && y + 4 + numFactors * 12 < footerY() - 2) {
+    // Divider
+    tft.drawFastHLine(M, y + 2, tft.width() - 2*M, TFT_DARKGREY);
+    y += 6;
+
+    tft.setTextFont(1); tft.setTextSize(1);
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.setCursor(lx, y); tft.print("Why:");
+    y += 10;
+
+    for (int i = 0; i < numFactors; i++) {
+      const RiskFactor& f = re.factors[i];
+      if (y + 10 >= footerY() - 2) break;
+
+      // Bullet
+      tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+      tft.setCursor(lx, y); tft.print("\x07 ");   // bullet char (font 1)
+
+      // Label
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.setCursor(lx + 8, y);
+      // Fit label
+      String lbl = String(f.label);
+      int maxLblW = tft.width() - lx - 8 - M - 24;
+      while (lbl.length() > 0 && tft.textWidth(lbl) > maxLblW) lbl.remove(lbl.length()-1);
+      tft.print(lbl);
+
+      // Delta value right-aligned
+      char buf[8];
+      snprintf(buf, sizeof(buf), "%+d", (int)f.delta);
+      uint16_t dColor = (f.delta > 0) ? TFT_RED : TFT_GREEN;
+      tft.setTextColor(dColor, TFT_BLACK);
+      int dw = tft.textWidth(buf);
+      tft.setCursor(tft.width() - M - dw, y);
+      tft.print(buf);
+
+      y += 11;
+    }
+  }
+
+  drawFooterHint("L: Back    Both: Portal", "R: Next");
+}
+
+// ═══════════════════════════════════════════════════════════
+// HOME, PORTAL_RESULT  (Phase 1–4, unchanged)
+// ═══════════════════════════════════════════════════════════
+void showHome(){
+  clearContent();drawHeader("WiFiGuard");
+  if(hasScannedOnce) drawStatusBox("Last scan: "+String(netCount)+" network(s)",TFT_CYAN);
+  else               drawStatusBox("READY — no scan yet",TFT_CYAN);
+  int cy=CONTENT_Y+48;resetTextState();
+  tft.setTextColor(TFT_WHITE,TFT_BLACK);tft.setCursor(M,cy);tft.print("RIGHT  Scan for networks");
+  tft.setTextColor(hasScannedOnce?TFT_WHITE:TFT_DARKGREY,TFT_BLACK);
+  tft.setCursor(M,cy+20);tft.print("LEFT   View last results");
+  tft.setTextFont(1);tft.setTextSize(1);tft.setTextColor(TFT_DARKGREY,TFT_BLACK);
+  tft.setCursor(M,cy+46);tft.print("Hold BOTH 1s = Settings");
+  drawFooterHint(hasScannedOnce?"L: Results":"","R: Scan");
+}
+
+void showPortalResult(PortalResult r){
+  clearContent();drawHeader("Portal Result");
+  drawStatusBox(portalToStr(r),portalColor(r));
+  resetTextState();
+  tft.setTextColor(TFT_DARKGREY,TFT_BLACK);tft.setCursor(M,CONTENT_Y+48);tft.print("Tested: ");
+  tft.setTextColor(TFT_WHITE,TFT_BLACK);tft.print(safeSSID(nets[SAFE_SEL].ssid,18));
+  drawFooterHint("L: Back to Analyze","R: List");
+}
+
+// ═══════════════════════════════════════════════════════════
+// Settings screen  (Phase 4, unchanged)
+// ═══════════════════════════════════════════════════════════
+static int settingsCursor=0;
+static const int SETTINGS_ROWS=5;
+
+void cycleSettingValue(int row){
+  switch(row){
+    case 0:
+      if(settings.brightness<50)settings.brightness=50;
+      else if(settings.brightness<100)settings.brightness=100;
+      else if(settings.brightness<150)settings.brightness=150;
+      else if(settings.brightness<200)settings.brightness=200;
+      else if(settings.brightness<255)settings.brightness=255;
+      else settings.brightness=50;
+      applyBrightness(settings.brightness);break;
+    case 1:{uint16_t o[]={30,60,120,300};int c=0;
+      for(int i=0;i<4;i++)if(settings.sleepSec==o[i]){c=i;break;}
+      settings.sleepSec=o[(c+1)%4];break;}
+    case 2:settings.sortMode=(SortMode)((settings.sortMode+1)%SORT_COUNT);break;
+    case 3:settings.showBSSID=!settings.showBSSID;break;
+    case 4:settings.hideHidden=!settings.hideHidden;break;
+  }
+}
+String settingValueStr(int row){
+  switch(row){
+    case 0:return String(settings.brightness);
+    case 1:return String(settings.sleepSec)+"s";
+    case 2:return sortModeStr(settings.sortMode);
+    case 3:return settings.showBSSID?"On":"Off";
+    case 4:return settings.hideHidden?"On":"Off";
+    default:return "?";
+  }
+}
+const char* settingLabelStr(int row){
+  switch(row){
+    case 0:return "Brightness";case 1:return "Sleep after";
+    case 2:return "Sort by";case 3:return "Show BSSID";
+    case 4:return "Hide hidden";default:return "?";
+  }
+}
+void drawSettingsRow(int row){
+  int w=tft.width(),rowH=18,y=CONTENT_Y+8+row*rowH;
+  bool isSel=(row==settingsCursor);
+  uint16_t bg=isSel?(uint16_t)TFT_DARKGREY:(uint16_t)TFT_BLACK;
+  tft.fillRect(M,y,w-2*M,rowH-1,bg);
+  tft.setTextFont(1);tft.setTextSize(1);
+  tft.setTextColor(isSel?(uint16_t)TFT_YELLOW:bg,bg);tft.setCursor(M+2,y+5);tft.print(isSel?">":"");
+  tft.setTextColor(isSel?(uint16_t)TFT_WHITE:(uint16_t)TFT_DARKGREY,bg);
+  tft.setCursor(M+12,y+5);tft.print(settingLabelStr(row));
+  String val=settingValueStr(row);
+  tft.setTextColor(isSel?(uint16_t)TFT_CYAN:(uint16_t)TFT_WHITE,bg);
+  tft.setCursor(w-M-tft.textWidth(val),y+5);tft.print(val);
+  if(row==0){
+    int barX=w-M-tft.textWidth(val)-40,barY2=y+6,barW=30,barH=6;
+    if(barX>M+80){
+      tft.drawRect(barX,barY2,barW,barH,isSel?(uint16_t)TFT_WHITE:(uint16_t)TFT_DARKGREY);
+      int fill=(barW-2)*settings.brightness/255;
+      tft.fillRect(barX+1,barY2+1,fill,barH-2,TFT_YELLOW);
+    }
+  }
+}
+void showSettings(){
+  clearContent();drawHeader("Settings");
+  for(int i=0;i<SETTINGS_ROWS;i++)drawSettingsRow(i);
+  tft.drawFastHLine(M,footerY()-2,tft.width()-2*M,TFT_DARKGREY);
+  drawFooterHint("L: Change","R: Next / Save");
+}
+
+// ═══════════════════════════════════════════════════════════
+// doScanList  (Phase 4 + P5 additions: updateNewMarkers,
+//              invalidateRiskCache, computeAllRisk)
+// ═══════════════════════════════════════════════════════════
+void doScanList(){
+  netCount=0;sel=0;
+  clearContent();drawHeader("WiFiGuard");drawFooterHint("","");
+  resetTextState();
+  tft.setTextColor(TFT_WHITE,TFT_BLACK);tft.setCursor(M,CONTENT_Y+14);
+  tft.print(hasScannedOnce?"Rescanning...":"Scanning...");
+  tft.setTextFont(1);tft.setTextSize(1);tft.setTextColor(TFT_DARKGREY,TFT_BLACK);
+  tft.setCursor(M,CONTENT_Y+32);tft.print("Looking for networks nearby");
+
+  int barW=tft.width()-2*M;
+  IndeterBar bar;bar.begin(M,CONTENT_Y+48,barW,12,TFT_CYAN);
+
+  WiFi.mode(WIFI_STA);WiFi.disconnect(true,true);delay(100);
+  WiFi.scanNetworks(true,true);
+
+  const uint32_t SCAN_TIMEOUT_MS=12000;
+  uint32_t t0=millis();int scanResult=WIFI_SCAN_RUNNING;
+  while(true){
+    uint32_t now=millis();bar.tick(now);
+    scanResult=WiFi.scanComplete();
+    if(scanResult>=0||scanResult==WIFI_SCAN_FAILED)break;
+    if(now-t0>=SCAN_TIMEOUT_MS){WiFi.scanDelete();scanResult=-1;break;}
+    delay(20);
+  }
+
+  if(scanResult<=0){
+    bar.error();delay(400);
+    clearContent();drawHeader("WiFiGuard");
+    drawStatusBox("NO NETWORKS FOUND",TFT_RED);drawFooterHint("","R: Retry");
+    WiFi.scanDelete();showToast("No networks found",TFT_RED,2000);return;
+  }
+  bar.complete();delay(120);
+
+  int raw=min(scanResult,25);netCount=0;
+  for(int i=0;i<raw;i++){
+    String ssid=WiFi.SSID(i);
+    if(settings.hideHidden){
+      String safe=safeSSID(ssid,64);
+      if(safe=="(hidden)"||safe=="(non-ascii)")continue;
+    }
+    if(netCount>=25)break;
+    nets[netCount].ssid=ssid;nets[netCount].rssi=WiFi.RSSI(i);
+    nets[netCount].enc=WiFi.encryptionType(i);nets[netCount].bssid=WiFi.BSSIDstr(i);
+    nets[netCount].channel=WiFi.channel(i);portalRes[netCount]=PORTAL_NOT_TESTED;
+    netCount++;
+  }
+  WiFi.scanDelete();
+
+  // [P5-6] Mark new APs (uses prevBSSIDs from last scan)
+  updateNewMarkers();
+
+  // [P5-2/5-3] Compute risk scores + channel congestion for all nets
+  invalidateRiskCache();
+  computeAllRisk();
+
+  // [P4-4] Sort (uses cachedRiskScore for SORT_RISK)
+  sortNets();
+
+  hasScannedOnce=true;
+  showList();
+  char tm[32];snprintf(tm,sizeof(tm),"Found %d network%s",netCount,netCount==1?"":"s");
+  showToast(tm,TFT_CYAN,1800);
+}
+
+// ═══════════════════════════════════════════════════════════
+// runPortalTest  (Phase 3/4 + P5: recompute risk after portal)
+// ═══════════════════════════════════════════════════════════
+PortalResult runPortalTest(const Net& n){
+  if(n.enc!=WIFI_AUTH_OPEN){
+    showToast("Portal: needs password",TFT_DARKGREY,1600);return PORTAL_NEEDS_PASSWORD;
+  }
+  clearContent();drawHeader("Portal Test");drawFooterHint("","");
+  resetTextState();tft.setTextColor(TFT_WHITE,TFT_BLACK);
+  tft.setCursor(M,CONTENT_Y+14);tft.print("Connecting to:");
+  drawFittedText(n.ssid,M,CONTENT_Y+30,tft.width()-2*M,TFT_YELLOW,TFT_BLACK);
+
+  int barW=tft.width()-2*M;
+  IndeterBar bar;bar.begin(M,CONTENT_Y+52,barW,12,TFT_YELLOW);
+  WiFi.mode(WIFI_STA);WiFi.disconnect(true);delay(150);WiFi.begin(n.ssid.c_str());
+  uint32_t t0=millis();
+  while(WiFi.status()!=WL_CONNECTED&&millis()-t0<9000){bar.tick(millis());delay(20);}
+  if(WiFi.status()!=WL_CONNECTED){
+    bar.error();delay(300);WiFi.disconnect(true);
+    showToast("Connect failed",TFT_RED,1800);return PORTAL_CONNECT_FAIL;
+  }
+  tft.setTextFont(1);tft.setTextSize(1);tft.setTextColor(TFT_DARKGREY,TFT_BLACK);
+  tft.setCursor(M,CONTENT_Y+52+18);tft.print("Connected. Checking internet...");
+  for(int i=0;i<5;i++){bar.tick(millis());delay(60);}
+
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);http.setTimeout(6000);
+  http.begin("http://connectivitycheck.gstatic.com/generate_204");
+  int code=http.GET();http.end();WiFi.disconnect(true);
+  bar.complete();delay(150);
+
+  PortalResult result;
+  if(code==204)result=PORTAL_NO_PORTAL;
+  else if(code<=0)result=PORTAL_NO_INTERNET;
+  else result=PORTAL_PORTAL_LIKELY;
+
+  // [P5-7] Recompute risk for this AP now that portal result is known
+  computeRisk(SAFE_SEL);
+
+  showToast(portalToStr(result),portalColor(result),1800);
+  return result;
+}
+
+// ═══════════════════════════════════════════════════════════
+// Idle animation + sleep
+// ═══════════════════════════════════════════════════════════
+void idleTickAnimation(ScreenState s){
+  if(!(s==HOME||s==LIST||s==ANALYZE))return;
+  if(millis()-lastIdleAnimMs<6000)return;lastIdleAnimMs=millis();
+  int x=tft.width()-34,y=footerY()-14;
+  tft.fillRect(x,y,30,10,TFT_BLACK);tft.setTextFont(1);tft.setTextSize(1);
+  tft.setTextColor(TFT_DARKGREY,TFT_BLACK);tft.setCursor(x,y+2);
+  idleFrame=(idleFrame+1)%3;
+  if(idleFrame==0)tft.print(".");if(idleFrame==1)tft.print("..");if(idleFrame==2)tft.print("...");
+}
+
+void goToSleep(){
+  tft.fillScreen(TFT_BLACK);resetTextState();
+  tft.setTextColor(TFT_DARKGREY,TFT_BLACK);tft.setCursor(M,60);tft.print("Sleeping...");
+  delay(300);applyBrightness(0);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BTN_ACT,0);esp_deep_sleep_start();
+}
+
+// ═══════════════════════════════════════════════════════════
+// Setup
+// ═══════════════════════════════════════════════════════════
+void setup(){
+  Serial.begin(115200);
+  initBacklight();
+  loadSettings();
+  applyBrightness(settings.brightness);
+  pinMode(BTN_NEXT,INPUT_PULLUP);pinMode(BTN_ACT,INPUT);
+  analogReadResolution(12);analogSetPinAttenuation(BAT_ADC,ADC_11db);
+  tft.init();tft.setTextWrap(false,false);tft.setRotation(ROT);tft.fillScreen(TFT_BLACK);
+  // Init NEW marker state (all zeros = no previous scan)
+  memset(prevBSSIDs,0,sizeof(prevBSSIDs));
+  memset(isNew,0,sizeof(isNew));
+  invalidateRiskCache();
+  lastInteractionMs=millis();
+  showHome();
+}
+
+// ═══════════════════════════════════════════════════════════
+// Loop  (Phase 4, unchanged except idleToSleepMs)
+// ═══════════════════════════════════════════════════════════
+void loop(){
+  uint32_t now=millis();tickToast(now);
+  if(now<ignoreInputUntilMs){delay(5);if(now-lastInteractionMs>idleToSleepMs())goToSleep();return;}
+  idleTickAnimation(state);
+
+  if(state==HOME){
+    if(digitalRead(BTN_NEXT)==LOW||digitalRead(BTN_ACT)==LOW){
+      if(chordHeld(1000)){lastInteractionMs=millis();settingsCursor=0;showSettings();state=SETTINGS;ignoreInputUntilMs=millis()+200;return;}
+    }
+    BtnEvent evR=readBtn(BTN_ACT),evL=readBtn(BTN_NEXT);
+    if(evR==BTN_TAP||evR==BTN_LONG){lastInteractionMs=millis();doScanList();state=LIST;ignoreInputUntilMs=millis()+150;}
+    else if(evL==BTN_TAP&&hasScannedOnce){lastInteractionMs=millis();showList();state=LIST;ignoreInputUntilMs=millis()+150;}
+  }
+  else if(state==LIST){
+    if(digitalRead(BTN_NEXT)==LOW||digitalRead(BTN_ACT)==LOW){
+      if(chordHeld(1000)){lastInteractionMs=millis();settingsCursor=0;showSettings();state=SETTINGS;ignoreInputUntilMs=millis()+200;return;}
+    }
+    BtnEvent evL=readBtn(BTN_NEXT),evR=readBtn(BTN_ACT);
+    if(evL==BTN_TAP){lastInteractionMs=millis();if(netCount>0){sel=(sel+1)%netCount;updateListSelectionUIDirty();}ignoreInputUntilMs=millis()+80;}
+    else if(evR==BTN_LONG){lastInteractionMs=millis();doScanList();state=LIST;ignoreInputUntilMs=millis()+150;}
+    else if(evR==BTN_TAP){lastInteractionMs=millis();if(netCount>0){showAnalysis(nets[SAFE_SEL]);state=ANALYZE;}ignoreInputUntilMs=millis()+150;}
+  }
+  else if(state==ANALYZE){
+    bool lLow=(digitalRead(BTN_NEXT)==LOW),rLow=(digitalRead(BTN_ACT)==LOW);
+    if(lLow||rLow){
+      uint32_t t0=millis();
+      while(millis()-t0<220){if(digitalRead(BTN_NEXT)==LOW&&digitalRead(BTN_ACT)==LOW)break;delay(5);}
+      if(digitalRead(BTN_NEXT)==LOW&&digitalRead(BTN_ACT)==LOW){
+        lastInteractionMs=millis();
+        while(digitalRead(BTN_NEXT)==LOW||digitalRead(BTN_ACT)==LOW)delay(5);
+        PortalResult res=runPortalTest(nets[SAFE_SEL]);portalRes[SAFE_SEL]=res;
+        showPortalResult(res);ignoreInputUntilMs=millis()+300;state=PORTAL_RESULT;return;
+      }
+      lLow=(digitalRead(BTN_NEXT)==LOW);rLow=(digitalRead(BTN_ACT)==LOW);
+      if(lLow){lastInteractionMs=millis();while(digitalRead(BTN_NEXT)==LOW)delay(5);showList();state=LIST;ignoreInputUntilMs=millis()+150;return;}
+      if(rLow){lastInteractionMs=millis();while(digitalRead(BTN_ACT)==LOW)delay(5);if(netCount>0){sel=(sel+1)%netCount;showAnalysis(nets[SAFE_SEL]);}ignoreInputUntilMs=millis()+150;return;}
+    }
+  }
+  else if(state==PORTAL_RESULT){
+    BtnEvent evL=readBtn(BTN_NEXT),evR=readBtn(BTN_ACT);
+    if(evL!=BTN_NONE){lastInteractionMs=millis();showAnalysis(nets[SAFE_SEL]);state=ANALYZE;ignoreInputUntilMs=millis()+200;return;}
+    if(evR!=BTN_NONE){lastInteractionMs=millis();showList();state=LIST;ignoreInputUntilMs=millis()+150;return;}
+  }
+  else if(state==SETTINGS){
+    BtnEvent evL=readBtn(BTN_NEXT),evR=readBtn(BTN_ACT);
+    if(evL==BTN_TAP){lastInteractionMs=millis();cycleSettingValue(settingsCursor);drawSettingsRow(settingsCursor);ignoreInputUntilMs=millis()+100;}
+    else if(evR==BTN_TAP){
+      lastInteractionMs=millis();
+      if(settingsCursor<SETTINGS_ROWS-1){int p=settingsCursor++;drawSettingsRow(p);drawSettingsRow(settingsCursor);}
+      else{saveSettings();if(netCount>0)sortNets();applyBrightness(settings.brightness);showToast("Settings saved",TFT_GREEN,1800);showHome();state=HOME;}
+      ignoreInputUntilMs=millis()+120;
+    }
+    else if(evL==BTN_LONG){lastInteractionMs=millis();loadSettings();applyBrightness(settings.brightness);showToast("Settings cancelled",TFT_DARKGREY,1600);showHome();state=HOME;ignoreInputUntilMs=millis()+200;}
+  }
+
+  if(millis()-lastInteractionMs>idleToSleepMs())goToSleep();
+  delay(20);
+}
+
+/*
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  PHASE 5 — TEST CHECKLIST                                                    ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║                                                                              ║
+║  RISK SCORING v2                                                             ║
+║  [ ] WPA3 network with strong signal → score 3–8 (LOW)                      ║
+║  [ ] WPA2 network with strong signal → score 8–13 (LOW)                     ║
+║  [ ] WPA network → score ~22+ (MED if also weak signal)                     ║
+║  [ ] WEP network → score ~45+ (HIGH or near HIGH)                           ║
+║  [ ] OPEN network → score 60+ (HIGH)                                        ║
+║  [ ] OPEN + portal likely → score 75+ (HIGH)                                ║
+║  [ ] SSID containing "free" adds +10 pts                                    ║
+║  [ ] SSID containing "guest" adds +5 pts                                    ║
+║  [ ] Weak signal (< −75 dBm) adds points vs strong signal                   ║
+║  [ ] Score never exceeds 100                                                 ║
+║  [ ] Score never goes below 0                                                ║
+║                                                                              ║
+║  CHANNEL CONGESTION                                                          ║
+║  [ ] In a crowded environment, congested-channel APs score higher            ║
+║  [ ] "Channel congested" appears as a factor when applicable                 ║
+║  [ ] 5GHz-only APs (channel > 14) do not receive congestion penalty         ║
+║                                                                              ║
+║  RISK FACTORS "WHY?" SECTION                                                 ║
+║  [ ] ANALYZE screen shows a "Why:" divider + bullet rows below data         ║
+║  [ ] Up to 3 bullet factors displayed                                        ║
+║  [ ] Each bullet shows label + right-aligned delta (+N or −N)               ║
+║  [ ] Positive delta (+N) shown in red, negative (−N) in green               ║
+║  [ ] Factors match the score (e.g. OPEN = "No encryption +60")              ║
+║  [ ] "Why?" section omitted if no factors or no vertical space               ║
+║  [ ] After running portal test, "Why?" updates with portal factor            ║
+║                                                                              ║
+║  NEW MARKER                                                                  ║
+║  [ ] On very first scan: all APs show "NEW!" tag (no previous data)         ║
+║  [ ] On rescan: APs from previous scan show sec tag, truly new APs "NEW!"   ║
+║  [ ] "NEW" badge visible in SSID box top-right corner                        ║
+║  [ ] After 2nd rescan: APs seen in scan N-1 no longer marked NEW            ║
+║  [ ] Mesh APs (same SSID, different BSSID) correctly distinguished         ║
+║                                                                              ║
+║  SORT_RISK mode                                                              ║
+║  [ ] With Sort=Risk score, highest-risk networks appear first in list        ║
+║  [ ] Changing portal result (test an OPEN AP) re-sorts correctly on         ║
+║      next Settings→save cycle or next scan                                  ║
+║                                                                              ║
+║  REGRESSIONS (must still pass from Phase 1–4)                               ║
+║  [ ] Settings screen: all 5 rows, chord access, save/cancel                 ║
+║  [ ] IndeterBar during scan and portal test                                  ║
+║  [ ] Toasts appear and auto-dismiss                                          ║
+║  [ ] Signal bars, lock icons, BSSID suffix (when enabled)                   ║
+║  [ ] Dirty list redraw (no full-screen flash on scroll)                     ║
+║  [ ] Battery widget on all screens                                           ║
+║  [ ] Sleep using settings.sleepSec timeout                                   ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+*/

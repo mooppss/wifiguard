@@ -97,6 +97,15 @@ const int M   = 12;
 // ═══════════════════════════════════════════════════════════
 #define SAFE_SEL (netCount > 0 ? constrain(sel, 0, netCount - 1) : 0)
 
+// Forward declarations for Arduino auto-prototype compatibility
+struct Net;
+struct CheckInfo;
+struct RiskEntry;
+enum SortMode : uint8_t;
+enum ScreenState : uint8_t;
+enum PortalResult : uint8_t;
+enum BtnEvent : uint8_t;
+
 // ═══════════════════════════════════════════════════════════
 // Settings  (Phase 4, unchanged)
 // ═══════════════════════════════════════════════════════════
@@ -119,7 +128,7 @@ Settings settings = { 200, 60, SORT_RSSI, true, false, false, true, false };
 // ═══════════════════════════════════════════════════════════
 // State machine
 // ═══════════════════════════════════════════════════════════
-enum ScreenState { HOME, LIST, ANALYZE, PORTAL_RESULT, SETTINGS };
+enum ScreenState : uint8_t { HOME, LIST, ANALYZE, PORTAL_RESULT, SETTINGS };
 ScreenState state = HOME;
 
 // ═══════════════════════════════════════════════════════════

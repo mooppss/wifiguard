@@ -98,6 +98,15 @@ const int M   = 12;
 // ═══════════════════════════════════════════════════════════
 #define SAFE_SEL (netCount > 0 ? constrain(sel, 0, netCount - 1) : 0)
 
+// Forward declarations for Arduino auto-prototype compatibility
+struct Net;
+struct CheckInfo;
+struct RiskEntry;
+enum SortMode : uint8_t;
+enum ScreenState : uint8_t;
+enum PortalResult : uint8_t;
+enum BtnEvent : uint8_t;
+
 // ═══════════════════════════════════════════════════════════
 // Settings  (Phase 4, unchanged)
 // ═══════════════════════════════════════════════════════════
@@ -151,7 +160,11 @@ bool hasScannedOnce = false;
 
 #define IDLE_TO_SLEEP_MS() ((uint32_t)settings.sleepSec * 1000UL)
 
-enum PortalResult : uint8_t {
+// Forward declarations for Arduino auto-prototype compatibility
+struct RiskEntry;
+enum BtnEvent : uint8_t;
+
+enum PortalResult {
   PORTAL_NOT_TESTED, PORTAL_NO_PORTAL, PORTAL_PORTAL_LIKELY,
   PORTAL_NO_INTERNET, PORTAL_CONNECT_FAIL, PORTAL_NEEDS_PASSWORD
 };
@@ -468,8 +481,7 @@ void saveSettings() {
 // Backlight  (Phase 4)
 // ═══════════════════════════════════════════════════════════
 void initBacklight() {
-#if (defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)) || \
-    (defined(ARDUINO_ESP32_MAJOR) && (ARDUINO_ESP32_MAJOR >= 3))
+#if defined(ARDUINO_ESP32_MAJOR) && (ARDUINO_ESP32_MAJOR >= 3)
   ledcAttach(TFT_BL, BL_LEDC_FREQ, BL_LEDC_RES);
 #else
   ledcSetup(BL_LEDC_CH, BL_LEDC_FREQ, BL_LEDC_RES);
@@ -477,8 +489,7 @@ void initBacklight() {
 #endif
 }
 void applyBrightness(uint8_t val) {
-#if (defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)) || \
-    (defined(ARDUINO_ESP32_MAJOR) && (ARDUINO_ESP32_MAJOR >= 3))
+#if defined(ARDUINO_ESP32_MAJOR) && (ARDUINO_ESP32_MAJOR >= 3)
   ledcWrite(TFT_BL, val);
 #else
   ledcWrite(BL_LEDC_CH, val);
@@ -509,6 +520,7 @@ void handleIdlePower(uint32_t now) {
 // ═══════════════════════════════════════════════════════════
 // Buttons  (Phase 1 + 4)
 // ═══════════════════════════════════════════════════════════
+enum BtnEvent : uint8_t { BTN_NONE, BTN_TAP, BTN_LONG };
 static const uint16_t BTN_LONG_THRESH = 800;
 static const uint16_t BTN_MAX_WAIT    = 1500;
 static const uint16_t BTN_DEBOUNCE_MS = 12;

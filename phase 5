@@ -59,6 +59,7 @@
 #include "esp_sleep.h"
 #include <HTTPClient.h>
 #include <WiFiClient.h>
+#include <WiFiClientSecure.h>
 #include <Preferences.h>
 
 // ═══════════════════════════════════════════════════════════
@@ -110,8 +111,11 @@ struct Settings {
   SortMode sortMode;
   bool     showBSSID;
   bool     hideHidden;
+  bool     signalAsPercent;
+  bool     verboseUi;
+  bool     serialExportEnabled;
 };
-Settings settings = { 200, 60, SORT_RSSI, true, false };
+Settings settings = { 200, 60, SORT_RSSI, true, false, false, true, false };
 inline uint32_t idleToSleepMs() { return (uint32_t)settings.sleepSec * 1000UL; }
 
 // ═══════════════════════════════════════════════════════════
@@ -127,6 +131,7 @@ uint32_t lastInteractionMs  = 0;
 uint32_t ignoreInputUntilMs = 0;
 uint32_t lastIdleAnimMs     = 0;
 uint8_t  idleFrame          = 0;
+bool     uiDimmed           = false;
 
 // ═══════════════════════════════════════════════════════════
 // Data model
@@ -149,6 +154,70 @@ enum PortalResult {
   PORTAL_NO_INTERNET, PORTAL_CONNECT_FAIL, PORTAL_NEEDS_PASSWORD
 };
 PortalResult portalRes[25];
+
+struct CheckInfo {
+  int16_t  httpCode;
+  int16_t  latencyMs;
+  uint8_t  flags;      // bit0=valid bit1=redirect bit2=html bit3=dns bit4=http bit5=tls
+  char     ctype[16];
+};
+CheckInfo checkInfo[25];
+
+inline bool cfValid(const CheckInfo& c){return c.flags & 0x01;}
+inline bool cfRedirect(const CheckInfo& c){return c.flags & 0x02;}
+inline bool cfHtml(const CheckInfo& c){return c.flags & 0x04;}
+inline bool cfDns(const CheckInfo& c){return c.flags & 0x08;}
+inline bool cfHttp(const CheckInfo& c){return c.flags & 0x10;}
+inline bool cfTls(const CheckInfo& c){return c.flags & 0x20;}
+
+void clearCheckInfo(int idx){
+  if(idx<0||idx>=25)return;
+  checkInfo[idx].httpCode = -1;
+  checkInfo[idx].latencyMs = -1;
+  checkInfo[idx].flags = 0;
+  checkInfo[idx].ctype[0] = '\0';
+}
+
+struct SessionLogEntry {
+  uint32_t tMs;
+  uint8_t  count;
+  int8_t   topRisk;
+  char     topSSID[20];
+};
+static const uint8_t MAX_SESSION_LOG = 12;
+SessionLogEntry sessionLog[MAX_SESSION_LOG];
+uint8_t sessionLogCount = 0;
+uint8_t sessionLogHead  = 0;
+
+void addSessionLog(uint8_t count, int topIdx) {
+  SessionLogEntry& e = sessionLog[sessionLogHead];
+  e.tMs = millis();
+  e.count = count;
+  e.topRisk = (topIdx >= 0) ? cachedRiskScore(topIdx) : -1;
+  String ss = (topIdx >= 0) ? safeSSID(nets[topIdx].ssid, 18) : String("none");
+  ss.toCharArray(e.topSSID, sizeof(e.topSSID));
+  sessionLogHead = (sessionLogHead + 1) % MAX_SESSION_LOG;
+  if (sessionLogCount < MAX_SESSION_LOG) sessionLogCount++;
+}
+
+void exportSessionLogToSerial() {
+  Serial.println("# WiFiGuard SessionLog");
+  Serial.println("idx,t_ms,count,top_risk,top_ssid");
+  for (uint8_t i = 0; i < sessionLogCount; i++) {
+    uint8_t idx = (sessionLogHead + MAX_SESSION_LOG - sessionLogCount + i) % MAX_SESSION_LOG;
+    const SessionLogEntry& e = sessionLog[idx];
+    Serial.printf("%u,%lu,%u,%d,%s\n", i, (unsigned long)e.tMs, e.count, e.topRisk, e.topSSID);
+  }
+  Serial.println("# WiFiGuard ScanExport");
+  Serial.println("ssid,bssid,rssi,channel,enc,risk,portal,http_code,latency_ms");
+  for (int i = 0; i < netCount; i++) {
+    String ssid = safeSSID(nets[i].ssid, 32);
+    String bssid = settings.showBSSID ? nets[i].bssid : String("hidden");
+    Serial.printf("%s,%s,%d,%d,%s,%d,%s,%d,%d\n",
+      ssid.c_str(), bssid.c_str(), nets[i].rssi, nets[i].channel, encTag(nets[i].enc).c_str(),
+      cachedRiskScore(i), portalToStr(portalRes[i]).c_str(), checkInfo[i].httpCode, checkInfo[i].latencyMs);
+  }
+}
 
 // ═══════════════════════════════════════════════════════════
 // [P5-1] RiskFactor + RiskCache
@@ -351,6 +420,12 @@ uint16_t riskColor(int s) {
   return TFT_GREEN;
 }
 
+String signalValueText(int rssi) {
+  if (!settings.signalAsPercent) return String(rssi) + " dBm";
+  int pct = constrain((int)((rssi + 100) * 2), 0, 100);
+  return String(pct) + "%";
+}
+
 // ═══════════════════════════════════════════════════════════
 // NVS  (Phase 4)
 // ═══════════════════════════════════════════════════════════
@@ -359,8 +434,11 @@ void loadSettings() {
   settings.brightness = prefs.getUChar("bright",    200);
   settings.sleepSec   = prefs.getUShort("sleepSec",  60);
   settings.sortMode   = (SortMode)prefs.getUChar("sortMode", SORT_RSSI);
-  settings.showBSSID  = prefs.getBool("showBSSID",  true);
-  settings.hideHidden = prefs.getBool("hideHidden", false);
+  settings.showBSSID      = prefs.getBool("showBSSID",  true);
+  settings.hideHidden     = prefs.getBool("hideHidden", false);
+  settings.signalAsPercent= prefs.getBool("sigPct",    false);
+  settings.verboseUi      = prefs.getBool("verbUI",    true);
+  settings.serialExportEnabled = prefs.getBool("serExp", false);
   prefs.end();
   settings.brightness = constrain(settings.brightness, 10, 255);
   if (settings.sortMode >= SORT_COUNT) settings.sortMode = SORT_RSSI;
@@ -376,6 +454,9 @@ void saveSettings() {
   prefs.putUChar("sortMode", (uint8_t)settings.sortMode);
   prefs.putBool("showBSSID", settings.showBSSID);
   prefs.putBool("hideHidden",settings.hideHidden);
+  prefs.putBool("sigPct",    settings.signalAsPercent);
+  prefs.putBool("verbUI",    settings.verboseUi);
+  prefs.putBool("serExp",    settings.serialExportEnabled);
   prefs.end();
 }
 
@@ -387,6 +468,27 @@ void initBacklight() {
   ledcAttachPin(TFT_BL, BL_LEDC_CH);
 }
 void applyBrightness(uint8_t val) { ledcWrite(BL_LEDC_CH, val); }
+
+uint8_t dimBrightnessLevel() {
+  return (uint8_t)max(8, (int)settings.brightness / 6);
+}
+
+void setDimmed(bool dim) {
+  uiDimmed = dim;
+  applyBrightness(dim ? dimBrightnessLevel() : settings.brightness);
+}
+
+void setWifiIdle() {
+  WiFi.disconnect(true, true);
+  delay(20);
+  WiFi.mode(WIFI_OFF);
+}
+
+void handleIdlePower(uint32_t now) {
+  uint32_t idleMs = now - lastInteractionMs;
+  uint32_t dimAt = max(10000UL, idleToSleepMs() * 7UL / 10UL);
+  if (!uiDimmed && idleMs >= dimAt) setDimmed(true);
+}
 
 // ═══════════════════════════════════════════════════════════
 // Buttons  (Phase 1 + 4)
@@ -424,6 +526,16 @@ bool chordHeld(uint32_t holdMs = 1000) {
   }
   while (digitalRead(BTN_NEXT) == LOW || digitalRead(BTN_ACT) == LOW) delay(5);
   return true;
+}
+
+void waitRelease(int pin, uint32_t timeoutMs = 700) {
+  uint32_t st = millis();
+  while (digitalRead(pin) == LOW && (millis() - st) < timeoutMs) delay(5);
+}
+
+void waitReleaseBoth(uint32_t timeoutMs = 900) {
+  uint32_t st = millis();
+  while ((digitalRead(BTN_NEXT) == LOW || digitalRead(BTN_ACT) == LOW) && (millis() - st) < timeoutMs) delay(5);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -492,6 +604,7 @@ void swapNet(int a, int b) {
   Net tmp=nets[a]; nets[a]=nets[b]; nets[b]=tmp;
   PortalResult ptmp=portalRes[a]; portalRes[a]=portalRes[b]; portalRes[b]=ptmp;
   RiskEntry rtmp=riskCache[a]; riskCache[a]=riskCache[b]; riskCache[b]=rtmp;
+  CheckInfo ctmp=checkInfo[a]; checkInfo[a]=checkInfo[b]; checkInfo[b]=ctmp;
   bool ntmp=isNew[a]; isNew[a]=isNew[b]; isNew[b]=ntmp;
 }
 
@@ -568,6 +681,13 @@ void drawHeader(const char* title) {
   tft.setCursor(M,8);tft.print(title);
   drawBatteryWidget();
 }
+
+void drawScreenScaffold(const char* title, const char* leftHint, const char* rightHint) {
+  clearContent();
+  drawHeader(title);
+  drawFooterHint(leftHint, rightHint);
+}
+
 void clearContent() {
   tft.fillRect(0,CONTENT_Y,tft.width(),tft.height()-CONTENT_Y,TFT_BLACK);
 }
@@ -587,6 +707,24 @@ void drawStatusBox(const String& txt, uint16_t color) {
   if (tft.textWidth(s)>maxW) tft.setTextFont(1);
   while (s.length()>0&&tft.textWidth(s+"..")>maxW) s.remove(s.length()-1);
   tft.setTextColor(color,TFT_BLACK);tft.setCursor(M+8,y+7);tft.print(s);
+}
+
+void drawLoadingLayout(const char* title, const char* line1, const char* line2) {
+  drawScreenScaffold(title, "", "");
+  resetTextState();
+  tft.setTextColor(TFT_WHITE,TFT_BLACK);tft.setCursor(M,CONTENT_Y+14);tft.print(line1);
+  tft.setTextFont(1);tft.setTextSize(1);tft.setTextColor(TFT_DARKGREY,TFT_BLACK);
+  tft.setCursor(M,CONTENT_Y+32);tft.print(line2);
+}
+
+void drawLoadingProgress(uint8_t pct, uint16_t color, const String& line2="") {
+  int barW=tft.width()-2*M;
+  drawProgressBar(M, CONTENT_Y+48, barW, 12, pct, color);
+  if (line2.length()>0) {
+    tft.fillRect(M, CONTENT_Y+66, tft.width()-2*M, 12, TFT_BLACK);
+    tft.setTextFont(1);tft.setTextSize(1);tft.setTextColor(TFT_DARKGREY,TFT_BLACK);
+    tft.setCursor(M,CONTENT_Y+68);tft.print(line2);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -614,6 +752,13 @@ void drawLockIcon(wifi_auth_mode_t enc,int x,int y,uint16_t bg=TFT_BLACK){
   tft.fillRect(x+1,y+1,2,6,col);
   if(!isOpen){tft.fillRect(x+7,y+1,2,6,col);tft.fillRect(x+1,y,8,2,col);}
   else{tft.fillRect(x+7,y-2,2,5,col);}
+}
+void drawPortalIcon(PortalResult pr,int x,int y,uint16_t bg=TFT_BLACK){
+  uint16_t col=portalColor(pr);
+  tft.fillRect(x,y,12,12,bg);
+  tft.drawCircle(x+5,y+5,4,col);
+  tft.drawFastVLine(x+10,y+2,7,col);
+  tft.drawFastHLine(x+8,y+10,4,col);
 }
 void drawProgressBar(int x,int y,int w,int h,int pct,uint16_t color){
   pct=constrain(pct,0,100);
@@ -750,8 +895,9 @@ void drawInfoRow(){
   tft.setTextColor(TFT_CYAN,TFT_BLACK);tft.setCursor(M+14,y+3);tft.print(encTag(n.enc));
   int barsX=M+14+26;
   drawSignalBars(n.rssi,barsX,y+2,TFT_BLACK);
-  tft.setTextColor(TFT_DARKGREY,TFT_BLACK);tft.setCursor(barsX+18,y+3);tft.printf("%d",n.rssi);
+  tft.setTextColor(TFT_DARKGREY,TFT_BLACK);tft.setCursor(barsX+18,y+3);tft.print(signalValueText(n.rssi));
   tft.setTextColor(TFT_WHITE,TFT_BLACK);tft.setCursor(w/2+10,y+3);tft.printf("Ch:%d",n.channel);
+  drawPortalIcon(portalRes[SAFE_SEL], w/2-8, y+1, TFT_BLACK);
   tft.setTextColor(TFT_YELLOW,TFT_BLACK);tft.setCursor(w-M-28,y+3);tft.printf("%d/%d",sel+1,netCount);
 }
 
@@ -766,21 +912,19 @@ void updateListSelectionUIDirty(){
 // LIST screen
 // ═══════════════════════════════════════════════════════════
 void showList(){
-  clearContent();drawHeader("WiFiGuard");
+  drawScreenScaffold("WiFiGuard", "L: Next", "R: Analyze  Hold: Rescan");
   if(netCount<=0){drawStatusBox("NO NETWORKS FOUND",TFT_RED);drawFooterHint("","R: Rescan");return;}
   resetTextState();tft.setTextColor(TFT_DARKGREY,TFT_BLACK);
   tft.setCursor(M,CONTENT_Y+4);tft.printf("Networks: %d",netCount);
   tft.drawRect(M,SSID_BOX_Y,tft.width()-2*M,SSID_BOX_H,TFT_WHITE);
   drawSSIDBox();drawInfoRow();drawListPanel();
-  drawFooterHint("L: Next","R: Analyze  Hold: Rescan");
 }
 
 // ═══════════════════════════════════════════════════════════
 // [P5-5] ANALYZE screen — adds "Why?" risk factor bullets
 // ═══════════════════════════════════════════════════════════
 void showAnalysis(const Net& n) {
-  clearContent();
-  drawHeader("Analyze");
+  drawScreenScaffold("Analyze", "L: Back    Both: Portal", "R: Next");
 
   int idx   = SAFE_SEL;
   int score = cachedRiskScore(idx);
@@ -795,25 +939,34 @@ void showAnalysis(const Net& n) {
   resetTextState(); tft.setTextFont(2); tft.setTextSize(1);
 
   auto row = [&](const char* label, const String& val,
-                 uint16_t valColor, bool withBars = false) {
+                 uint16_t valColor, bool withBars = false, bool withPortal = false) {
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK); tft.setCursor(lx, y); tft.print(label);
     if (withBars) {
       tft.setTextColor(valColor, TFT_BLACK); tft.setCursor(vx, y); tft.print(val);
       drawSignalBars(nets[idx].rssi, vx + tft.textWidth(val) + 4, y + 2, TFT_BLACK);
     } else {
       tft.setTextColor(valColor, TFT_BLACK); tft.setCursor(vx, y);
-      int maxVW = tft.width() - vx - M; String v = val;
+      int maxVW = tft.width() - vx - M - (withPortal ? 12 : 0); String v = val;
       while (v.length() > 0 && tft.textWidth(v + "..") > maxVW) v.remove(v.length()-1);
       tft.print(v);
+      if (withPortal) drawPortalIcon(portalRes[idx], tft.width() - M - 12, y + 1, TFT_BLACK);
     }
     y += lineH;
   };
 
   row("SSID:",     safeSSID(n.ssid, 16),              TFT_GREEN);
-  row("Signal:",   String(n.rssi) + " dBm",           TFT_CYAN,  true);
+  row("Signal:",   signalValueText(n.rssi),           TFT_CYAN,  true);
   row("Security:", encToStr(n.enc),                   TFT_WHITE);
   row("Channel:",  String(n.channel),                 TFT_WHITE);
-  row("Portal:",   portalToStr(portalRes[idx]),        portalColor(portalRes[idx]));
+  row("Portal:",   portalToStr(portalRes[idx]),        portalColor(portalRes[idx]), false, true);
+  if (cfValid(checkInfo[idx])) {
+    String reach = String(cfDns(checkInfo[idx])?"DNS:Y":"DNS:N") + " " +
+                   String(cfHttp(checkInfo[idx])?"HTTP:Y":"HTTP:N") + " " +
+                   String(cfTls(checkInfo[idx])?"TLS:Y":"TLS:N");
+    String proto = "Code:" + String(checkInfo[idx].httpCode) + " " + String(checkInfo[idx].latencyMs) + "ms";
+    row("Reach:", reach, TFT_DARKGREY);
+    if (settings.verboseUi) row("HTTP:", proto, TFT_DARKGREY);
+  }
 
   drawLockIcon(n.enc, lx, y - lineH * 3 + 2, TFT_BLACK);
 
@@ -881,39 +1034,39 @@ void showAnalysis(const Net& n) {
     }
   }
 
-  drawFooterHint("L: Back    Both: Portal", "R: Next");
 }
 
 // ═══════════════════════════════════════════════════════════
 // HOME, PORTAL_RESULT  (Phase 1–4, unchanged)
 // ═══════════════════════════════════════════════════════════
 void showHome(){
-  clearContent();drawHeader("WiFiGuard");
+  drawScreenScaffold("WiFiGuard", hasScannedOnce ? "L: Results" : "", "R: Scan");
   if(hasScannedOnce) drawStatusBox("Last scan: "+String(netCount)+" network(s)",TFT_CYAN);
-  else               drawStatusBox("READY — no scan yet",TFT_CYAN);
+  else               drawStatusBox("Ready: press RIGHT to start",TFT_CYAN);
   int cy=CONTENT_Y+48;resetTextState();
-  tft.setTextColor(TFT_WHITE,TFT_BLACK);tft.setCursor(M,cy);tft.print("RIGHT  Scan for networks");
+  tft.setTextColor(TFT_WHITE,TFT_BLACK);tft.setCursor(M,cy);tft.print("RIGHT  Start WiFi scan");
   tft.setTextColor(hasScannedOnce?TFT_WHITE:TFT_DARKGREY,TFT_BLACK);
-  tft.setCursor(M,cy+20);tft.print("LEFT   View last results");
+  tft.setCursor(M,cy+20);tft.print("LEFT   Open latest results");
   tft.setTextFont(1);tft.setTextSize(1);tft.setTextColor(TFT_DARKGREY,TFT_BLACK);
-  tft.setCursor(M,cy+46);tft.print("Hold BOTH 1s = Settings");
-  drawFooterHint(hasScannedOnce?"L: Results":"","R: Scan");
+  tft.setCursor(M,cy+46);tft.print("Hold BOTH 1s for Settings");
+  if(settings.verboseUi){
+    tft.setCursor(M,cy+58);tft.print("Defensive scan only. No attack features.");
+  }
 }
 
 void showPortalResult(PortalResult r){
-  clearContent();drawHeader("Portal Result");
+  drawScreenScaffold("Portal Result", "L: Back to Analyze", "R: List");
   drawStatusBox(portalToStr(r),portalColor(r));
   resetTextState();
   tft.setTextColor(TFT_DARKGREY,TFT_BLACK);tft.setCursor(M,CONTENT_Y+48);tft.print("Tested: ");
   tft.setTextColor(TFT_WHITE,TFT_BLACK);tft.print(safeSSID(nets[SAFE_SEL].ssid,18));
-  drawFooterHint("L: Back to Analyze","R: List");
 }
 
 // ═══════════════════════════════════════════════════════════
 // Settings screen  (Phase 4, unchanged)
 // ═══════════════════════════════════════════════════════════
 static int settingsCursor=0;
-static const int SETTINGS_ROWS=5;
+static const int SETTINGS_ROWS=9;
 
 void cycleSettingValue(int row){
   switch(row){
@@ -924,13 +1077,20 @@ void cycleSettingValue(int row){
       else if(settings.brightness<200)settings.brightness=200;
       else if(settings.brightness<255)settings.brightness=255;
       else settings.brightness=50;
-      applyBrightness(settings.brightness);break;
+      setDimmed(false);break;
     case 1:{uint16_t o[]={30,60,120,300};int c=0;
       for(int i=0;i<4;i++)if(settings.sleepSec==o[i]){c=i;break;}
       settings.sleepSec=o[(c+1)%4];break;}
     case 2:settings.sortMode=(SortMode)((settings.sortMode+1)%SORT_COUNT);break;
     case 3:settings.showBSSID=!settings.showBSSID;break;
     case 4:settings.hideHidden=!settings.hideHidden;break;
+    case 5:settings.signalAsPercent=!settings.signalAsPercent;break;
+    case 6:settings.verboseUi=!settings.verboseUi;break;
+    case 7:settings.serialExportEnabled=!settings.serialExportEnabled;break;
+    case 8:
+      if(settings.serialExportEnabled){exportSessionLogToSerial();showToast("Exported to Serial",TFT_CYAN,1800);}
+      else{showToast("Enable Serial export first",TFT_ORANGE,1800);}
+      break;
   }
 }
 String settingValueStr(int row){
@@ -940,6 +1100,10 @@ String settingValueStr(int row){
     case 2:return sortModeStr(settings.sortMode);
     case 3:return settings.showBSSID?"On":"Off";
     case 4:return settings.hideHidden?"On":"Off";
+    case 5:return settings.signalAsPercent?"%":"dBm";
+    case 6:return settings.verboseUi?"Detailed":"Simple";
+    case 7:return settings.serialExportEnabled?"Enabled":"Disabled";
+    case 8:return "Run";
     default:return "?";
   }
 }
@@ -947,7 +1111,9 @@ const char* settingLabelStr(int row){
   switch(row){
     case 0:return "Brightness";case 1:return "Sleep after";
     case 2:return "Sort by";case 3:return "Show BSSID";
-    case 4:return "Hide hidden";default:return "?";
+    case 4:return "Hide hidden";case 5:return "Signal units";
+    case 6:return "UI verbosity";case 7:return "Serial export";
+    case 8:return "Export now";default:return "?";
   }
 }
 void drawSettingsRow(int row){
@@ -975,7 +1141,7 @@ void showSettings(){
   clearContent();drawHeader("Settings");
   for(int i=0;i<SETTINGS_ROWS;i++)drawSettingsRow(i);
   tft.drawFastHLine(M,footerY()-2,tft.width()-2*M,TFT_DARKGREY);
-  drawFooterHint("L: Change","R: Next / Save");
+  drawFooterHint("L: Change/Run Hold:Cancel","R: Next / Save");
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -983,38 +1149,36 @@ void showSettings(){
 //              invalidateRiskCache, computeAllRisk)
 // ═══════════════════════════════════════════════════════════
 void doScanList(){
+  setDimmed(false);
   netCount=0;sel=0;
-  clearContent();drawHeader("WiFiGuard");drawFooterHint("","");
-  resetTextState();
-  tft.setTextColor(TFT_WHITE,TFT_BLACK);tft.setCursor(M,CONTENT_Y+14);
-  tft.print(hasScannedOnce?"Rescanning...":"Scanning...");
-  tft.setTextFont(1);tft.setTextSize(1);tft.setTextColor(TFT_DARKGREY,TFT_BLACK);
-  tft.setCursor(M,CONTENT_Y+32);tft.print("Looking for networks nearby");
-
-  int barW=tft.width()-2*M;
-  IndeterBar bar;bar.begin(M,CONTENT_Y+48,barW,12,TFT_CYAN);
+  drawLoadingLayout("WiFiGuard", hasScannedOnce?"Rescanning...":"Scanning...", "Preparing WiFi radio...");
+  drawLoadingProgress(3, TFT_CYAN);
 
   WiFi.mode(WIFI_STA);WiFi.disconnect(true,true);delay(100);
+  drawLoadingProgress(8, TFT_CYAN, "Starting active scan...");
   WiFi.scanNetworks(true,true);
 
   const uint32_t SCAN_TIMEOUT_MS=12000;
   uint32_t t0=millis();int scanResult=WIFI_SCAN_RUNNING;
   while(true){
-    uint32_t now=millis();bar.tick(now);
+    uint32_t now=millis();
     scanResult=WiFi.scanComplete();
     if(scanResult>=0||scanResult==WIFI_SCAN_FAILED)break;
+    uint8_t pct=(uint8_t)(8 + min<uint32_t>(72, ((now-t0)*72)/SCAN_TIMEOUT_MS));
+    drawLoadingProgress(pct, TFT_CYAN, "Scanning channels...");
     if(now-t0>=SCAN_TIMEOUT_MS){WiFi.scanDelete();scanResult=-1;break;}
     delay(20);
   }
 
   if(scanResult<=0){
-    bar.error();delay(400);
+    drawLoadingProgress(100, TFT_RED, "Scan failed or no AP found");
+    delay(280);
     clearContent();drawHeader("WiFiGuard");
     drawStatusBox("NO NETWORKS FOUND",TFT_RED);drawFooterHint("","R: Retry");
     WiFi.scanDelete();showToast("No networks found",TFT_RED,2000);return;
   }
-  bar.complete();delay(120);
 
+  drawLoadingProgress(84, TFT_CYAN, "Parsing scan results...");
   int raw=min(scanResult,25);netCount=0;
   for(int i=0;i<raw;i++){
     String ssid=WiFi.SSID(i);
@@ -1026,66 +1190,129 @@ void doScanList(){
     nets[netCount].ssid=ssid;nets[netCount].rssi=WiFi.RSSI(i);
     nets[netCount].enc=WiFi.encryptionType(i);nets[netCount].bssid=WiFi.BSSIDstr(i);
     nets[netCount].channel=WiFi.channel(i);portalRes[netCount]=PORTAL_NOT_TESTED;
+    clearCheckInfo(netCount);
     netCount++;
   }
   WiFi.scanDelete();
 
-  // [P5-6] Mark new APs (uses prevBSSIDs from last scan)
+  drawLoadingProgress(90, TFT_CYAN, "Updating NEW markers...");
   updateNewMarkers();
 
-  // [P5-2/5-3] Compute risk scores + channel congestion for all nets
+  drawLoadingProgress(95, TFT_CYAN, "Computing risk + sorting...");
   invalidateRiskCache();
   computeAllRisk();
-
-  // [P4-4] Sort (uses cachedRiskScore for SORT_RISK)
+  int topIdx = -1; int topRisk = -1;
+  for (int i=0;i<netCount;i++){int r=cachedRiskScore(i); if(r>topRisk){topRisk=r; topIdx=i;}}
+  addSessionLog((uint8_t)netCount, topIdx);
   sortNets();
 
   hasScannedOnce=true;
+  drawLoadingProgress(100, TFT_GREEN, "Done");
+  delay(120);
   showList();
   char tm[32];snprintf(tm,sizeof(tm),"Found %d network%s",netCount,netCount==1?"":"s");
   showToast(tm,TFT_CYAN,1800);
+  setWifiIdle();
 }
 
 // ═══════════════════════════════════════════════════════════
 // runPortalTest  (Phase 3/4 + P5: recompute risk after portal)
 // ═══════════════════════════════════════════════════════════
 PortalResult runPortalTest(const Net& n){
+  setDimmed(false);
   if(n.enc!=WIFI_AUTH_OPEN){
     showToast("Portal: needs password",TFT_DARKGREY,1600);return PORTAL_NEEDS_PASSWORD;
   }
-  clearContent();drawHeader("Portal Test");drawFooterHint("","");
-  resetTextState();tft.setTextColor(TFT_WHITE,TFT_BLACK);
-  tft.setCursor(M,CONTENT_Y+14);tft.print("Connecting to:");
+  drawLoadingLayout("Portal Test", "Connecting to:", "Association in progress...");
   drawFittedText(n.ssid,M,CONTENT_Y+30,tft.width()-2*M,TFT_YELLOW,TFT_BLACK);
+  drawLoadingProgress(4, TFT_YELLOW);
 
-  int barW=tft.width()-2*M;
-  IndeterBar bar;bar.begin(M,CONTENT_Y+52,barW,12,TFT_YELLOW);
   WiFi.mode(WIFI_STA);WiFi.disconnect(true);delay(150);WiFi.begin(n.ssid.c_str());
   uint32_t t0=millis();
-  while(WiFi.status()!=WL_CONNECTED&&millis()-t0<9000){bar.tick(millis());delay(20);}
+  const uint32_t CONNECT_TIMEOUT_MS=9000;
+  while(WiFi.status()!=WL_CONNECTED&&millis()-t0<CONNECT_TIMEOUT_MS){
+    uint8_t pct=(uint8_t)(4 + min<uint32_t>(60, ((millis()-t0)*60)/CONNECT_TIMEOUT_MS));
+    drawLoadingProgress(pct, TFT_YELLOW, "Waiting for DHCP...");
+    delay(20);
+  }
   if(WiFi.status()!=WL_CONNECTED){
-    bar.error();delay(300);WiFi.disconnect(true);
+    drawLoadingProgress(100, TFT_RED, "Connect failed");
+    delay(240);WiFi.disconnect(true);
     showToast("Connect failed",TFT_RED,1800);return PORTAL_CONNECT_FAIL;
   }
-  tft.setTextFont(1);tft.setTextSize(1);tft.setTextColor(TFT_DARKGREY,TFT_BLACK);
-  tft.setCursor(M,CONTENT_Y+52+18);tft.print("Connected. Checking internet...");
-  for(int i=0;i<5;i++){bar.tick(millis());delay(60);}
 
-  HTTPClient http;
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);http.setTimeout(6000);
-  http.begin("http://connectivitycheck.gstatic.com/generate_204");
-  int code=http.GET();http.end();WiFi.disconnect(true);
-  bar.complete();delay(150);
+  int idx = SAFE_SEL;
+  clearCheckInfo(idx);
+  checkInfo[idx].flags = 0x01; // valid
+
+  IPAddress ip;
+  bool dnsOk = (WiFi.hostByName("example.com", ip) == 1);
+  if (dnsOk) checkInfo[idx].flags |= 0x08;
+
+  auto probeHttp = [&](const char* url, int& code, bool& redir, bool& html, String& ctype, int& latency)->bool{
+    HTTPClient http;
+    const char* hdrs[] = {"Location", "Content-Type"};
+    http.collectHeaders(hdrs, 2);
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    http.setTimeout(6000);
+    if (!http.begin(url)) { code = -1; latency = -1; return false; }
+    uint32_t ts = millis();
+    code = http.GET();
+    latency = (int)(millis() - ts);
+    String loc = http.header("Location");
+    ctype = http.header("Content-Type");
+    http.end();
+    redir = (code >= 300 && code < 400) || loc.length() > 0;
+    String lc = ctype; lc.toLowerCase();
+    html = (lc.indexOf("text/html") >= 0);
+    return code > 0;
+  };
+
+  drawLoadingProgress(72, TFT_YELLOW, "Checking captive portal...");
+  int code1=-1, lat1=-1, code2=-1, lat2=-1;
+  bool red1=false, html1=false, red2=false, html2=false;
+  String ct1="", ct2="";
+  bool ok1 = probeHttp("http://connectivitycheck.gstatic.com/generate_204", code1, red1, html1, ct1, lat1);
+  bool ok2 = false;
+  if (!(ok1 && code1 == 204 && !red1 && !html1)) {
+    drawLoadingProgress(84, TFT_YELLOW, "Fallback endpoint...");
+    ok2 = probeHttp("http://neverssl.com/", code2, red2, html2, ct2, lat2);
+  }
+
+  drawLoadingProgress(92, TFT_YELLOW, "Checking TLS capability...");
+  WiFiClientSecure tls;
+  tls.setInsecure();
+  bool tlsOk = tls.connect("example.com", 443);
+  tls.stop();
+  if (tlsOk) checkInfo[idx].flags |= 0x20;
+
+  checkInfo[idx].httpCode = (code1 > 0) ? code1 : code2;
+  checkInfo[idx].latencyMs = (lat1 >= 0) ? lat1 : lat2;
+  if (ok1 || ok2) checkInfo[idx].flags |= 0x10;
+  bool redir = red1 || red2;
+  bool html = html1 || html2;
+  if (redir) checkInfo[idx].flags |= 0x02;
+  if (html) checkInfo[idx].flags |= 0x04;
+  String ctype = ct1.length() ? ct1 : ct2;
+  ctype.toLowerCase();
+  if (ctype.length() > 15) ctype = ctype.substring(0, 15);
+  ctype.toCharArray(checkInfo[idx].ctype, sizeof(checkInfo[idx].ctype));
+
+  WiFi.disconnect(true);
+  drawLoadingProgress(100, TFT_GREEN, "Check complete");
+  delay(120);
 
   PortalResult result;
-  if(code==204)result=PORTAL_NO_PORTAL;
-  else if(code<=0)result=PORTAL_NO_INTERNET;
-  else result=PORTAL_PORTAL_LIKELY;
+  if (ok1 && code1 == 204 && !redir && !html) result = PORTAL_NO_PORTAL;
+  else if (!(ok1 || ok2) && !dnsOk)           result = PORTAL_NO_INTERNET;
+  else                                         result = PORTAL_PORTAL_LIKELY;
 
-  // [P5-7] Recompute risk for this AP now that portal result is known
-  computeRisk(SAFE_SEL);
+  computeRisk(idx);
 
-  showToast(portalToStr(result),portalColor(result),1800);
+  char toast[48];
+  snprintf(toast,sizeof(toast),"%s (%dms)",portalToStr(result).c_str(), max(0,checkInfo[idx].latencyMs));
+  showToast(toast,portalColor(result),1800);
+  setWifiIdle();
   return result;
 }
 
@@ -1105,7 +1332,8 @@ void idleTickAnimation(ScreenState s){
 void goToSleep(){
   tft.fillScreen(TFT_BLACK);resetTextState();
   tft.setTextColor(TFT_DARKGREY,TFT_BLACK);tft.setCursor(M,60);tft.print("Sleeping...");
-  delay(300);applyBrightness(0);
+  setWifiIdle();
+  delay(120);applyBrightness(0);
   esp_sleep_enable_ext0_wakeup((gpio_num_t)BTN_ACT,0);esp_deep_sleep_start();
 }
 
@@ -1116,14 +1344,25 @@ void setup(){
   Serial.begin(115200);
   initBacklight();
   loadSettings();
-  applyBrightness(settings.brightness);
+  setDimmed(false);
   pinMode(BTN_NEXT,INPUT_PULLUP);pinMode(BTN_ACT,INPUT);
   analogReadResolution(12);analogSetPinAttenuation(BAT_ADC,ADC_11db);
   tft.init();tft.setTextWrap(false,false);tft.setRotation(ROT);tft.fillScreen(TFT_BLACK);
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+    drawScreenScaffold("WiFiGuard", "", "R: Wake");
+    resetTextState(); tft.setTextColor(TFT_CYAN,TFT_BLACK);
+    tft.setCursor(M,CONTENT_Y+18); tft.print("Woke from sleep");
+    tft.setTextColor(TFT_DARKGREY,TFT_BLACK);
+    tft.setCursor(M,CONTENT_Y+34); tft.print("Press RIGHT to scan");
+    delay(120);
+  }
   // Init NEW marker state (all zeros = no previous scan)
   memset(prevBSSIDs,0,sizeof(prevBSSIDs));
   memset(isNew,0,sizeof(isNew));
+  for (int i=0;i<25;i++) clearCheckInfo(i);
+  memset(sessionLog,0,sizeof(sessionLog)); sessionLogCount=0; sessionLogHead=0;
   invalidateRiskCache();
+  setWifiIdle();
   lastInteractionMs=millis();
   showHome();
 }
@@ -1133,6 +1372,9 @@ void setup(){
 // ═══════════════════════════════════════════════════════════
 void loop(){
   uint32_t now=millis();tickToast(now);
+  bool anyPressed = (digitalRead(BTN_NEXT)==LOW || digitalRead(BTN_ACT)==LOW);
+  if(anyPressed && uiDimmed) setDimmed(false);
+  handleIdlePower(now);
   if(now<ignoreInputUntilMs){delay(5);if(now-lastInteractionMs>idleToSleepMs())goToSleep();return;}
   idleTickAnimation(state);
 
@@ -1160,19 +1402,19 @@ void loop(){
       while(millis()-t0<220){if(digitalRead(BTN_NEXT)==LOW&&digitalRead(BTN_ACT)==LOW)break;delay(5);}
       if(digitalRead(BTN_NEXT)==LOW&&digitalRead(BTN_ACT)==LOW){
         lastInteractionMs=millis();
-        while(digitalRead(BTN_NEXT)==LOW||digitalRead(BTN_ACT)==LOW)delay(5);
+        waitReleaseBoth();
         PortalResult res=runPortalTest(nets[SAFE_SEL]);portalRes[SAFE_SEL]=res;
         showPortalResult(res);ignoreInputUntilMs=millis()+300;state=PORTAL_RESULT;return;
       }
       lLow=(digitalRead(BTN_NEXT)==LOW);rLow=(digitalRead(BTN_ACT)==LOW);
-      if(lLow){lastInteractionMs=millis();while(digitalRead(BTN_NEXT)==LOW)delay(5);showList();state=LIST;ignoreInputUntilMs=millis()+150;return;}
-      if(rLow){lastInteractionMs=millis();while(digitalRead(BTN_ACT)==LOW)delay(5);if(netCount>0){sel=(sel+1)%netCount;showAnalysis(nets[SAFE_SEL]);}ignoreInputUntilMs=millis()+150;return;}
+      if(lLow){lastInteractionMs=millis();waitRelease(BTN_NEXT);showList();state=LIST;ignoreInputUntilMs=millis()+150;return;}
+      if(rLow){lastInteractionMs=millis();waitRelease(BTN_ACT);if(netCount>0){sel=(sel+1)%netCount;showAnalysis(nets[SAFE_SEL]);}ignoreInputUntilMs=millis()+150;return;}
     }
   }
   else if(state==PORTAL_RESULT){
     BtnEvent evL=readBtn(BTN_NEXT),evR=readBtn(BTN_ACT);
-    if(evL!=BTN_NONE){lastInteractionMs=millis();showAnalysis(nets[SAFE_SEL]);state=ANALYZE;ignoreInputUntilMs=millis()+200;return;}
-    if(evR!=BTN_NONE){lastInteractionMs=millis();showList();state=LIST;ignoreInputUntilMs=millis()+150;return;}
+    if(evL==BTN_TAP&&netCount>0){lastInteractionMs=millis();showAnalysis(nets[SAFE_SEL]);state=ANALYZE;ignoreInputUntilMs=millis()+200;return;}
+    if(evR==BTN_TAP){lastInteractionMs=millis();showList();state=LIST;ignoreInputUntilMs=millis()+150;return;}
   }
   else if(state==SETTINGS){
     BtnEvent evL=readBtn(BTN_NEXT),evR=readBtn(BTN_ACT);
@@ -1180,10 +1422,10 @@ void loop(){
     else if(evR==BTN_TAP){
       lastInteractionMs=millis();
       if(settingsCursor<SETTINGS_ROWS-1){int p=settingsCursor++;drawSettingsRow(p);drawSettingsRow(settingsCursor);}
-      else{saveSettings();if(netCount>0)sortNets();applyBrightness(settings.brightness);showToast("Settings saved",TFT_GREEN,1800);showHome();state=HOME;}
+      else{saveSettings();if(netCount>0)sortNets();setDimmed(false);showToast("Settings saved",TFT_GREEN,1800);showHome();state=HOME;}
       ignoreInputUntilMs=millis()+120;
     }
-    else if(evL==BTN_LONG){lastInteractionMs=millis();loadSettings();applyBrightness(settings.brightness);showToast("Settings cancelled",TFT_DARKGREY,1600);showHome();state=HOME;ignoreInputUntilMs=millis()+200;}
+    else if(evL==BTN_LONG){lastInteractionMs=millis();loadSettings();setDimmed(false);showToast("Settings cancelled",TFT_DARKGREY,1600);showHome();state=HOME;ignoreInputUntilMs=millis()+200;}
   }
 
   if(millis()-lastInteractionMs>idleToSleepMs())goToSleep();

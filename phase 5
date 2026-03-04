@@ -159,7 +159,11 @@ bool hasScannedOnce = false;
 
 #define IDLE_TO_SLEEP_MS() ((uint32_t)settings.sleepSec * 1000UL)
 
-enum PortalResult : uint8_t {
+// Forward declarations for Arduino auto-prototype compatibility
+struct RiskEntry;
+enum BtnEvent : uint8_t;
+
+enum PortalResult {
   PORTAL_NOT_TESTED, PORTAL_NO_PORTAL, PORTAL_PORTAL_LIKELY,
   PORTAL_NO_INTERNET, PORTAL_CONNECT_FAIL, PORTAL_NEEDS_PASSWORD
 };

@@ -89,14 +89,22 @@ Preferences prefs;
 
 const int ROT = 0;
 const int M   = 12;
-
-inline int footerY()  { return tft.height() - FOOTER_H; }
-inline int contentH() { return tft.height() - HEADER_H - FOOTER_H; }
+#define FOOTER_Y()  (tft.height() - FOOTER_H)
+#define CONTENT_H() (tft.height() - HEADER_H - FOOTER_H)
 
 // ═══════════════════════════════════════════════════════════
 // Defensive bounds
 // ═══════════════════════════════════════════════════════════
 #define SAFE_SEL (netCount > 0 ? constrain(sel, 0, netCount - 1) : 0)
+
+// Forward declarations for Arduino auto-prototype compatibility
+struct Net;
+struct CheckInfo;
+struct RiskEntry;
+enum SortMode : uint8_t;
+enum ScreenState : uint8_t;
+enum PortalResult : uint8_t;
+enum BtnEvent : uint8_t;
 
 // ═══════════════════════════════════════════════════════════
 // Settings  (Phase 4, unchanged)
@@ -116,12 +124,11 @@ struct Settings {
   bool     serialExportEnabled;
 };
 Settings settings = { 200, 60, SORT_RSSI, true, false, false, true, false };
-inline uint32_t idleToSleepMs() { return (uint32_t)settings.sleepSec * 1000UL; }
 
 // ═══════════════════════════════════════════════════════════
 // State machine
 // ═══════════════════════════════════════════════════════════
-enum ScreenState { HOME, LIST, ANALYZE, PORTAL_RESULT, SETTINGS };
+enum ScreenState : uint8_t { HOME, LIST, ANALYZE, PORTAL_RESULT, SETTINGS };
 ScreenState state = HOME;
 
 // ═══════════════════════════════════════════════════════════
@@ -149,7 +156,10 @@ int  netCount       = 0;
 int  sel            = 0;
 bool hasScannedOnce = false;
 
-enum PortalResult {
+
+#define IDLE_TO_SLEEP_MS() ((uint32_t)settings.sleepSec * 1000UL)
+
+enum PortalResult : uint8_t {
   PORTAL_NOT_TESTED, PORTAL_NO_PORTAL, PORTAL_PORTAL_LIKELY,
   PORTAL_NO_INTERNET, PORTAL_CONNECT_FAIL, PORTAL_NEEDS_PASSWORD
 };
@@ -464,10 +474,20 @@ void saveSettings() {
 // Backlight  (Phase 4)
 // ═══════════════════════════════════════════════════════════
 void initBacklight() {
+#if defined(ARDUINO_ESP32_MAJOR) && (ARDUINO_ESP32_MAJOR >= 3)
+  ledcAttach(TFT_BL, BL_LEDC_FREQ, BL_LEDC_RES);
+#else
   ledcSetup(BL_LEDC_CH, BL_LEDC_FREQ, BL_LEDC_RES);
   ledcAttachPin(TFT_BL, BL_LEDC_CH);
+#endif
 }
-void applyBrightness(uint8_t val) { ledcWrite(BL_LEDC_CH, val); }
+void applyBrightness(uint8_t val) {
+#if defined(ARDUINO_ESP32_MAJOR) && (ARDUINO_ESP32_MAJOR >= 3)
+  ledcWrite(TFT_BL, val);
+#else
+  ledcWrite(BL_LEDC_CH, val);
+#endif
+}
 
 uint8_t dimBrightnessLevel() {
   return (uint8_t)max(8, (int)settings.brightness / 6);
@@ -486,14 +506,14 @@ void setWifiIdle() {
 
 void handleIdlePower(uint32_t now) {
   uint32_t idleMs = now - lastInteractionMs;
-  uint32_t dimAt = max(10000UL, idleToSleepMs() * 7UL / 10UL);
+  uint32_t dimAt = max(10000UL, IDLE_TO_SLEEP_MS() * 7UL / 10UL);
   if (!uiDimmed && idleMs >= dimAt) setDimmed(true);
 }
 
 // ═══════════════════════════════════════════════════════════
 // Buttons  (Phase 1 + 4)
 // ═══════════════════════════════════════════════════════════
-enum BtnEvent { BTN_NONE, BTN_TAP, BTN_LONG };
+enum BtnEvent : uint8_t { BTN_NONE, BTN_TAP, BTN_LONG };
 static const uint16_t BTN_LONG_THRESH = 800;
 static const uint16_t BTN_MAX_WAIT    = 1500;
 static const uint16_t BTN_DEBOUNCE_MS = 12;
@@ -692,7 +712,7 @@ void clearContent() {
   tft.fillRect(0,CONTENT_Y,tft.width(),tft.height()-CONTENT_Y,TFT_BLACK);
 }
 void drawFooterHint(const char* l, const char* r) {
-  int fy=footerY(),w=tft.width();
+  int fy=FOOTER_Y(),w=tft.width();
   tft.fillRect(0,fy,w,FOOTER_H,TFT_DARKGREY);
   tft.setTextFont(1);tft.setTextSize(1);tft.setTextColor(TFT_WHITE,TFT_DARKGREY);
   if (l&&l[0]){tft.setCursor(M,fy+4);tft.print(l);}
@@ -811,7 +831,7 @@ struct IndeterBar {
 struct Toast{bool active;uint32_t showMs,durationMs;int x,y,w,h;char msg[40];uint16_t color;};
 static Toast g_toast={false,0,0,0,0,0,0,{},TFT_WHITE};
 void showToast(const char* msg,uint16_t color=TFT_WHITE,uint32_t dur=1800){
-  int tw=tft.width()-2*M,th=18,tx=M,ty=footerY()-th-4;
+  int tw=tft.width()-2*M,th=18,tx=M,ty=FOOTER_Y()-th-4;
   tft.fillRect(tx,ty,tw,th,TFT_DARKGREY);tft.drawRect(tx,ty,tw,th,TFT_WHITE);
   tft.setTextFont(1);tft.setTextSize(1);tft.setTextColor(color,TFT_DARKGREY);
   int textW=tft.textWidth(msg);
@@ -838,7 +858,7 @@ static const int INFO_ROW_Y=CONTENT_Y+18+40+6,INFO_ROW_H=14;
 // [P5-6] drawListPanel updated: show "NEW" in magenta when isNew[idx]
 void drawListPanel(){
   if(netCount<=0)return;
-  int w=tft.width(),pX=M,pY=listPanelY(),pW=w-2*M,pH=footerY()-pY-2;
+  int w=tft.width(),pX=M,pY=listPanelY(),pW=w-2*M,pH=FOOTER_Y()-pY-2;
   if(pH<LP_ROWS*12)return;
   int rowH=(pH-2*LP_PAD)/LP_ROWS;
   tft.drawRect(pX,pY,pW,pH,TFT_WHITE);tft.fillRect(pX+1,pY+1,pW-2,pH-2,TFT_BLACK);
@@ -904,7 +924,7 @@ void drawInfoRow(){
 void updateListSelectionUIDirty(){
   if(netCount<=0)return;
   drawSSIDBox();drawInfoRow();
-  int w=tft.width(),pX=M,pY=listPanelY(),pW=w-2*M,pH=footerY()-pY-2;
+  int w=tft.width(),pX=M,pY=listPanelY(),pW=w-2*M,pH=FOOTER_Y()-pY-2;
   tft.fillRect(pX+1,pY+1,pW-2,pH-2,TFT_BLACK);drawListPanel();
 }
 
@@ -994,7 +1014,7 @@ void showAnalysis(const Net& n) {
   const RiskEntry& re = riskCache[idx];
   int numFactors = min((int)re.factorCount, 3);  // top 3
 
-  if (numFactors > 0 && y + 4 + numFactors * 12 < footerY() - 2) {
+  if (numFactors > 0 && y + 4 + numFactors * 12 < FOOTER_Y() - 2) {
     // Divider
     tft.drawFastHLine(M, y + 2, tft.width() - 2*M, TFT_DARKGREY);
     y += 6;
@@ -1006,7 +1026,7 @@ void showAnalysis(const Net& n) {
 
     for (int i = 0; i < numFactors; i++) {
       const RiskFactor& f = re.factors[i];
-      if (y + 10 >= footerY() - 2) break;
+      if (y + 10 >= FOOTER_Y() - 2) break;
 
       // Bullet
       tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
@@ -1140,7 +1160,7 @@ void drawSettingsRow(int row){
 void showSettings(){
   clearContent();drawHeader("Settings");
   for(int i=0;i<SETTINGS_ROWS;i++)drawSettingsRow(i);
-  tft.drawFastHLine(M,footerY()-2,tft.width()-2*M,TFT_DARKGREY);
+  tft.drawFastHLine(M,FOOTER_Y()-2,tft.width()-2*M,TFT_DARKGREY);
   drawFooterHint("L: Change/Run Hold:Cancel","R: Next / Save");
 }
 
@@ -1310,7 +1330,7 @@ PortalResult runPortalTest(const Net& n){
   computeRisk(idx);
 
   char toast[48];
-  snprintf(toast,sizeof(toast),"%s (%dms)",portalToStr(result).c_str(), max(0,checkInfo[idx].latencyMs));
+  snprintf(toast,sizeof(toast),"%s (%dms)",portalToStr(result).c_str(), max<int>(0,checkInfo[idx].latencyMs));
   showToast(toast,portalColor(result),1800);
   setWifiIdle();
   return result;
@@ -1322,7 +1342,7 @@ PortalResult runPortalTest(const Net& n){
 void idleTickAnimation(ScreenState s){
   if(!(s==HOME||s==LIST||s==ANALYZE))return;
   if(millis()-lastIdleAnimMs<6000)return;lastIdleAnimMs=millis();
-  int x=tft.width()-34,y=footerY()-14;
+  int x=tft.width()-34,y=FOOTER_Y()-14;
   tft.fillRect(x,y,30,10,TFT_BLACK);tft.setTextFont(1);tft.setTextSize(1);
   tft.setTextColor(TFT_DARKGREY,TFT_BLACK);tft.setCursor(x,y+2);
   idleFrame=(idleFrame+1)%3;
@@ -1375,7 +1395,7 @@ void loop(){
   bool anyPressed = (digitalRead(BTN_NEXT)==LOW || digitalRead(BTN_ACT)==LOW);
   if(anyPressed && uiDimmed) setDimmed(false);
   handleIdlePower(now);
-  if(now<ignoreInputUntilMs){delay(5);if(now-lastInteractionMs>idleToSleepMs())goToSleep();return;}
+  if(now<ignoreInputUntilMs){delay(5);if(now-lastInteractionMs>IDLE_TO_SLEEP_MS())goToSleep();return;}
   idleTickAnimation(state);
 
   if(state==HOME){
@@ -1428,7 +1448,7 @@ void loop(){
     else if(evL==BTN_LONG){lastInteractionMs=millis();loadSettings();setDimmed(false);showToast("Settings cancelled",TFT_DARKGREY,1600);showHome();state=HOME;ignoreInputUntilMs=millis()+200;}
   }
 
-  if(millis()-lastInteractionMs>idleToSleepMs())goToSleep();
+  if(millis()-lastInteractionMs>IDLE_TO_SLEEP_MS())goToSleep();
   delay(20);
 }
 
